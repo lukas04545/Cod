@@ -16,7 +16,7 @@ import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-    QMainWindow, QProgressBar, QPushButton, QSlider, QVBoxLayout,
+    QMainWindow, QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout,
     QWidget, QCheckBox,
 )
 from PyQt5.QtGui import QPalette, QColor
@@ -124,7 +124,7 @@ class SpectrumWidget(pg.PlotWidget):
 # Main window
 # ---------------------------------------------------------------------------
 
-LEARN_SECONDS = 8   # how long the auto-stop timer runs
+DEFAULT_LEARN_SECONDS = 8   # default auto-stop time (adjustable in the GUI)
 
 
 class MainWindow(QMainWindow):
@@ -135,7 +135,8 @@ class MainWindow(QMainWindow):
 
         self._processor = FootstepEnhancer()
         self._engine: StreamEngine | None = None
-        self._learn_ticks = 0
+        self._learn_duration = DEFAULT_LEARN_SECONDS
+        self._learn_elapsed_ticks = 0
 
         self._build_ui()
         self._apply_dark_theme()
@@ -261,16 +262,28 @@ class MainWindow(QMainWindow):
         learn_lay = QVBoxLayout(learn_grp)
 
         tip = QLabel(
-            "HOW TO USE:  Start the stream, enter a game, walk around on different surfaces "
-            f"for ~{LEARN_SECONDS}s, then click  \"Learn Footsteps\".  "
-            "The app captures only moderate-energy sounds (skips silence & gunshots), "
-            "finds the exact frequency peaks, and builds a custom amplification mask."
+            "HOW TO USE:  Start the stream, enter a game, click \"Learn Footsteps\" "
+            "and walk around on different surfaces for the chosen learn time "
+            "(longer = better profile; don't shoot or reload while learning). "
+            "The app captures step onsets, finds the exact frequency peaks, builds "
+            "a custom amplification mask and trains the AI step classifier."
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #bbb; font-size: 11px;")
         learn_lay.addWidget(tip)
 
         btn_row = QHBoxLayout()
+        btn_row.addWidget(QLabel("Learn time:"))
+        self._learn_spin = QSpinBox()
+        self._learn_spin.setRange(0, 120)
+        self._learn_spin.setValue(DEFAULT_LEARN_SECONDS)
+        self._learn_spin.setSuffix(" s")
+        self._learn_spin.setSpecialValueText("manual")  # 0 = until stopped
+        self._learn_spin.setToolTip(
+            "Auto-stop after this many seconds (set to \"manual\" to record "
+            "until you click Stop Learning)")
+        btn_row.addWidget(self._learn_spin)
+
         self._learn_btn = QPushButton("Learn Footsteps")
         self._learn_btn.setFixedHeight(34)
         self._learn_btn.setStyleSheet(
@@ -423,15 +436,19 @@ class MainWindow(QMainWindow):
             self._learn_status.setStyleSheet(f"color: {RED};")
             return
 
-        # Start learning
+        # Start learning (duration from the spinbox; 0 = manual stop)
+        self._learn_duration = self._learn_spin.value()
+        self._learn_elapsed_ticks = 0
         learner.start()
-        self._learn_ticks = LEARN_SECONDS * 4   # 250 ms ticks
-        self._learn_btn.setText(f"Stop Learning  ({LEARN_SECONDS}s)")
+        if self._learn_duration > 0:
+            self._learn_btn.setText(f"Stop Learning  ({self._learn_duration}s)")
+        else:
+            self._learn_btn.setText("Stop Learning")
         self._learn_btn.setStyleSheet(
             "QPushButton { background: #7a2200; color: white; font-weight: bold; border-radius:5px; }"
         )
         self._use_learned_cb.setEnabled(False)
-        self._learn_status.setText(f"Listening …  0 frames captured")
+        self._learn_status.setText("Listening …  0 frames captured")
         self._learn_status.setStyleSheet(f"color: {ORANGE};")
         self._learn_timer.start()
 
@@ -439,18 +456,23 @@ class MainWindow(QMainWindow):
         """Called every 250 ms while learning."""
         learner = self._processor.learner
         frames = learner.frames_collected
-        elapsed = LEARN_SECONDS - (self._learn_ticks * 0.25)
+        onsets = learner.onset_frames_collected
+        self._learn_elapsed_ticks += 1
+        elapsed = self._learn_elapsed_ticks * 0.25
 
         # Live spectrum preview
         avg = learner.get_avg_spectrum()
         self._spectrum_widget.update_spectrum(avg, None, [])
 
+        if self._learn_duration > 0:
+            progress = f"({elapsed:.1f}s / {self._learn_duration}s)"
+        else:
+            progress = f"({elapsed:.1f}s — click Stop Learning to finish)"
         self._learn_status.setText(
-            f"Listening …  {frames} frames captured  ({elapsed:.1f}s / {LEARN_SECONDS}s)"
+            f"Listening …  {frames} frames, {onsets} step onsets  {progress}"
         )
 
-        self._learn_ticks -= 1
-        if self._learn_ticks <= 0:
+        if self._learn_duration > 0 and elapsed >= self._learn_duration:
             self._stop_learning()
 
     def _stop_learning(self) -> None:
