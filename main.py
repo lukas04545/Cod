@@ -197,19 +197,47 @@ class MainWindow(QMainWindow):
 
         # --- Controls ---
         ctrl_grp = QGroupBox("Enhancement Controls")
-        ctrl_lay = QHBoxLayout(ctrl_grp)
+        ctrl_outer = QVBoxLayout(ctrl_grp)
 
+        row1 = QHBoxLayout()
         self._gain_w, self._gain_sl = _labeled_slider("Footstep Gain\n(×0.1)", 10, 120, 30)
         self._gain_sl.valueChanged.connect(lambda v: setattr(self._processor, "footstep_gain", v * 0.1))
-        ctrl_lay.addWidget(self._gain_w)
+        row1.addWidget(self._gain_w)
 
         self._amb_w, self._amb_sl = _labeled_slider("Ambient Suppress\n(% kept)", 0, 100, 25)
         self._amb_sl.valueChanged.connect(lambda v: setattr(self._processor, "ambient_suppress", v / 100))
-        ctrl_lay.addWidget(self._amb_w)
+        row1.addWidget(self._amb_w)
 
         self._duck_w, self._duck_sl = _labeled_slider("Gunshot Duck\n(% kept)", 0, 50, 10)
         self._duck_sl.valueChanged.connect(lambda v: setattr(self._processor, "gunshot_duck", v / 100))
-        ctrl_lay.addWidget(self._duck_w)
+        row1.addWidget(self._duck_w)
+        ctrl_outer.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self._nr_w, self._nr_sl = _labeled_slider("Noise Reduction\n(%)", 0, 100, 100)
+        self._nr_sl.valueChanged.connect(lambda v: setattr(self._processor, "noise_reduction", v / 100))
+        row2.addWidget(self._nr_w)
+
+        self._boost_w, self._boost_sl = _labeled_slider("Step Boost\n(×0.1)", 10, 60, 25)
+        self._boost_sl.valueChanged.connect(lambda v: setattr(self._processor, "footstep_boost", v * 0.1))
+        row2.addWidget(self._boost_w)
+
+        self._sens_w, self._sens_sl = _labeled_slider("Detect Sensitivity\n(1–10)", 1, 10, 5)
+        self._sens_sl.valueChanged.connect(lambda v: setattr(self._processor, "detect_sensitivity", float(v)))
+        row2.addWidget(self._sens_w)
+        ctrl_outer.addLayout(row2)
+
+        opt_row = QHBoxLayout()
+        self._agc_cb = QCheckBox("Auto volume (brings distant quiet steps up)")
+        self._agc_cb.stateChanged.connect(lambda s: setattr(self._processor, "agc_enabled", bool(s)))
+        opt_row.addWidget(self._agc_cb)
+
+        opt_row.addStretch()
+
+        self._step_indicator = QLabel("● STEP")
+        self._step_indicator.setStyleSheet("color: #333; font-weight: bold; font-size: 14px;")
+        opt_row.addWidget(self._step_indicator)
+        ctrl_outer.addLayout(opt_row)
 
         root.addWidget(ctrl_grp)
 
@@ -467,9 +495,17 @@ class MainWindow(QMainWindow):
         if self._engine and self._engine.is_running():
             self._vu_in.setValue(int(min(self._engine.vu_in * 300, 100)))
             self._vu_out.setValue(int(min(self._engine.vu_out * 300, 100)))
+            if self._processor.footstep_active > 0:
+                self._step_indicator.setStyleSheet(
+                    f"color: {GREEN}; font-weight: bold; font-size: 14px;")
+            else:
+                self._step_indicator.setStyleSheet(
+                    "color: #333; font-weight: bold; font-size: 14px;")
         else:
             self._vu_in.setValue(0)
             self._vu_out.setValue(0)
+            self._step_indicator.setStyleSheet(
+                "color: #333; font-weight: bold; font-size: 14px;")
 
     # ------------------------------------------------------------------
     # Theme

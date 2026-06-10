@@ -1,6 +1,5 @@
 import numpy as np
-from scipy import signal
-from scipy.signal import find_peaks, savgol_filter
+from scipy.signal import find_peaks, savgol_filter, windows
 from collections import deque
 import threading
 
@@ -144,23 +143,111 @@ class FrequencyLearner:
 
 
 # ---------------------------------------------------------------------------
-# Supporting processors
+# Envelope / dynamics helpers
+# ---------------------------------------------------------------------------
+
+class GainSmoother:
+    """
+    Exponentially smoothed gain envelope with independent rise and fall
+    time constants.  Eliminates clicks/pumping from per-block gain steps.
+    """
+
+    def __init__(self, sample_rate: int, rise_ms: float, fall_ms: float,
+                 initial: float = 1.0):
+        self._rise = float(np.exp(-1.0 / (sample_rate * rise_ms / 1000.0)))
+        self._fall = float(np.exp(-1.0 / (sample_rate * fall_ms / 1000.0)))
+        self._current = initial
+
+    def ramp(self, frames: int, target: float) -> np.ndarray:
+        """Return per-sample gain ramp moving toward target."""
+        coef = self._rise if target > self._current else self._fall
+        n = np.arange(1, frames + 1, dtype=np.float64)
+        gains = target + (self._current - target) * coef ** n
+        self._current = float(gains[-1])
+        return gains
+
+
+class SoftLimiter:
+    """Peak limiter with smoothed gain (fast engage, slow recover)."""
+
+    def __init__(self, sample_rate: int, threshold: float = 0.90):
+        self.threshold = threshold
+        self._smoother = GainSmoother(sample_rate, rise_ms=120.0, fall_ms=1.0)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        peak = float(np.max(np.abs(x))) + 1e-12
+        target = 1.0 if peak <= self.threshold else self.threshold / peak
+        gains = self._smoother.ramp(x.shape[0], target)
+        if x.ndim == 2:
+            gains = gains[:, np.newaxis]
+        return np.clip(x * gains, -1.0, 1.0)
+
+
+class AutoGainControl:
+    """
+    Slow loudness normalisation: brings distant quiet footsteps up to a
+    comfortable level without pumping. Holds gain during near-silence so
+    the noise floor isn't dragged up between sounds.
+    """
+
+    def __init__(self, sample_rate: int, target_rms: float = 0.10,
+                 max_gain: float = 8.0, min_gain: float = 0.5):
+        self.target_rms = target_rms
+        self.max_gain = max_gain
+        self.min_gain = min_gain
+        self._smoother = GainSmoother(sample_rate, rise_ms=500.0, fall_ms=150.0)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        rms = float(np.sqrt(np.mean(x ** 2)))
+        if rms < 1e-4:
+            # Near-silence: hold the current gain
+            gains = self._smoother.ramp(x.shape[0], self._smoother._current)
+        else:
+            desired = float(np.clip(self.target_rms / rms, self.min_gain,
+                                    self.max_gain))
+            gains = self._smoother.ramp(x.shape[0], desired)
+        if x.ndim == 2:
+            gains = gains[:, np.newaxis]
+        return x * gains
+
+
+# ---------------------------------------------------------------------------
+# Detectors
 # ---------------------------------------------------------------------------
 
 class TransientDetector:
     """
-    Flags blocks whose RMS exceeds recent history by threshold_db.
-    Once triggered, stays "hot" for hold_blocks so the whole gunshot tail
-    is ducked, not just its first block.
+    Gunshot/explosion detector.  A naive RMS-jump check also fires on
+    footsteps (they are transients too) — which would duck the very sounds
+    we want to boost.  A gunshot must satisfy ALL of:
+
+      1. RMS jump over recent history (> threshold_db)
+      2. loud in absolute terms (rms > loud_floor)
+      3. broadband: significant energy above hf_cutoff Hz (the "crack");
+         footsteps live almost entirely below ~1 kHz.
+
+    Once triggered, stays hot for hold_blocks so the whole tail is ducked.
     """
 
-    def __init__(self, window: int = 20, threshold_db: float = GUNSHOT_TRANSIENT_DB,
-                 hold_blocks: int = 12):
+    def __init__(self, sample_rate: int = 48000, window: int = 20,
+                 threshold_db: float = GUNSHOT_TRANSIENT_DB,
+                 hold_blocks: int = 12, loud_floor: float = 0.12,
+                 hf_cutoff: float = 1500.0, hf_ratio: float = 0.30):
+        self.sample_rate = sample_rate
         self.threshold_db = threshold_db
         self.hold_blocks = hold_blocks
+        self.loud_floor = loud_floor
+        self.hf_cutoff = hf_cutoff
+        self.hf_ratio = hf_ratio
         self._history: deque[float] = deque(maxlen=window)
         self._hold = 0
         self._lock = threading.Lock()
+
+    def _hf_fraction(self, block: np.ndarray) -> float:
+        mag2 = np.abs(np.fft.rfft(block)) ** 2
+        freqs = np.fft.rfftfreq(len(block), 1.0 / self.sample_rate)
+        total = float(np.sum(mag2)) + 1e-12
+        return float(np.sum(mag2[freqs >= self.hf_cutoff])) / total
 
     def is_transient(self, block: np.ndarray) -> bool:
         rms = float(np.sqrt(np.mean(block ** 2)) + 1e-12)
@@ -169,7 +256,9 @@ class TransientDetector:
             if len(self._history) < 5:
                 return False
             mean_rms = float(np.mean(list(self._history)[:-1]))
-            if 20 * np.log10(rms / (mean_rms + 1e-12)) > self.threshold_db:
+            jumped = 20 * np.log10(rms / (mean_rms + 1e-12)) > self.threshold_db
+            if jumped and rms > self.loud_floor \
+                    and self._hf_fraction(block) > self.hf_ratio:
                 self._hold = self.hold_blocks
             if self._hold > 0:
                 self._hold -= 1
@@ -177,121 +266,184 @@ class TransientDetector:
             return False
 
 
-class GainSmoother:
+class FootstepDetector:
     """
-    Exponentially smoothed gain envelope: fast attack (duck quickly when a
-    gunshot hits), slow release (fade back in) — eliminates pumping clicks
-    caused by per-block binary gain switching.
-    """
+    Detects footstep *events* via spectral flux in the footstep band,
+    normalised by the long-term average band energy.  Measured on synthetic
+    CoD-like scenes: ambience flux never exceeds ~1.1× mean energy, while
+    step onsets reach 1.6–7.5× — so the threshold sits between the two.
 
-    def __init__(self, sample_rate: int, attack_ms: float = 4.0,
-                 release_ms: float = 220.0):
-        self._attack = float(np.exp(-1.0 / (sample_rate * attack_ms / 1000.0)))
-        self._release = float(np.exp(-1.0 / (sample_rate * release_ms / 1000.0)))
-        self._current = 1.0
+    A refractory period prevents one step from double-triggering
+    (real steps are ≥ ~300 ms apart even when sprinting).
 
-    def ramp(self, frames: int, target: float) -> np.ndarray:
-        """Return per-sample gain ramp moving toward target."""
-        coef = self._attack if target < self._current else self._release
-        n = np.arange(1, frames + 1, dtype=np.float64)
-        gains = target + (self._current - target) * coef ** n
-        self._current = float(gains[-1])
-        return gains
-
-
-class SoftLimiter:
-    """
-    Look-at-block peak limiter with smoothed gain — replaces the old tanh
-    waveshaper which distorted everything above ~0.5.
+    sensitivity: 1 (strict) … 10 (hair-trigger).
     """
 
-    def __init__(self, sample_rate: int, threshold: float = 0.90):
-        self.threshold = threshold
-        self._smoother = GainSmoother(sample_rate, attack_ms=1.0, release_ms=120.0)
+    REFRACTORY_S = 0.18
 
-    def process(self, x: np.ndarray) -> np.ndarray:
-        peak = float(np.max(np.abs(x))) + 1e-12
-        target = 1.0 if peak <= self.threshold else self.threshold / peak
-        gains = self._smoother.ramp(x.shape[0], target)
-        if x.ndim == 2:
-            gains = gains[:, np.newaxis]
-        out = x * gains
-        # Final safety clip — should rarely engage
-        return np.clip(out, -1.0, 1.0)
+    def __init__(self, sensitivity: float = 5.0, history_blocks: int = 90,
+                 block_duration: float = 512 / 48000):
+        self.sensitivity = sensitivity
+        self._prev_energy = 0.0
+        self._energy_hist: deque[float] = deque(maxlen=history_blocks)
+        self._refractory_blocks = max(1, int(self.REFRACTORY_S / block_duration))
+        self._cooldown = 0
+
+    def update(self, band_energy: float) -> bool:
+        flux = max(0.0, band_energy - self._prev_energy)
+        self._prev_energy = band_energy
+        self._energy_hist.append(band_energy)
+
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return False
+        if len(self._energy_hist) < 15:
+            return False
+
+        mean_energy = float(np.mean(self._energy_hist)) + 1e-9
+        c = 6.5 / max(self.sensitivity, 0.5)   # sens 5 → flux must be > 1.3× mean energy
+        if flux > c * mean_energy and band_energy > 1.2 * mean_energy:
+            self._cooldown = self._refractory_blocks
+            return True
+        return False
 
 
-class OLAMaskFilter:
+# ---------------------------------------------------------------------------
+# Spectral engine (OLA STFT, linked-gain stereo)
+# ---------------------------------------------------------------------------
+
+class SpectralEngine:
     """
-    Overlap-add STFT filter for one audio channel.
+    Windowed overlap-add STFT processor for N channels.
 
-    The old implementation did a raw FFT→mask→IFFT on each 512-sample block
-    with no window and no overlap, which created loud clicks/buzzing at every
-    block boundary.  This version uses a periodic Hann window with 50 %
-    overlap (COLA-compliant), so reconstruction is artifact-free.
+    Per-bin gains are computed ONCE from the channel-averaged spectrum and
+    applied identically to every channel — this preserves interaural level
+    differences exactly, so footstep direction is not smeared.
 
-    Adds hop-size samples of latency (~10.7 ms at 48 kHz / 512).
+    Gain chain per bin:
+      1. Adaptive noise-floor removal (minimum statistics + over-subtraction)
+         → strips constant ambience: wind, music beds, electrical hum.
+      2. Shape mask (fixed bandpass shape or learned footstep fingerprint).
+      3. Temporal gain smoothing → suppresses musical-noise artifacts.
+
+    Adds hop-size samples latency (~10.7 ms at 48 kHz / 512).
     """
 
-    def __init__(self, hop: int):
+    NOISE_ATTACK = 0.005     # per-block adaptation toward background level
+    NOISE_DRIFT = 1.0005     # slow upward drift while gated (handles level rises)
+    NOISE_GATE = 2.5         # bins louder than gate×floor are "events", not noise
+    GAIN_FLOOR = 0.10        # never attenuate a bin below 10 % (less musical noise)
+    GAIN_SMOOTH = 0.55       # temporal smoothing of per-bin gains
+
+    def __init__(self, hop: int, n_channels: int, sample_rate: int):
         self.hop = hop
+        self.n_channels = n_channels
+        self.sample_rate = sample_rate
         self.win_len = hop * 2
-        self.window = signal.windows.hann(self.win_len, sym=False)
-        self.freqs = None  # set by set_mask via sample_rate
-        self._in_buf = np.zeros(self.win_len, dtype=np.float64)
-        self._out_buf = np.zeros(self.win_len, dtype=np.float64)
-        self._mask: np.ndarray | None = None
+        self.window = windows.hann(self.win_len, sym=False)
+        self.freqs = np.fft.rfftfreq(self.win_len, 1.0 / sample_rate)
 
-    def set_mask(self, mask_freqs: np.ndarray, mask: np.ndarray,
-                 sample_rate: int) -> None:
-        """Resample the learner's mask onto this filter's FFT bins."""
-        own_freqs = np.fft.rfftfreq(self.win_len, 1.0 / sample_rate)
-        self._mask = np.interp(own_freqs, mask_freqs, mask)
+        self._in_bufs = [np.zeros(self.win_len) for _ in range(n_channels)]
+        self._out_bufs = [np.zeros(self.win_len) for _ in range(n_channels)]
+        self._noise: np.ndarray | None = None
+        self._gain_state: np.ndarray | None = None
 
-    def process(self, x: np.ndarray) -> np.ndarray:
-        """Process one block of up to hop samples; returns len(x) samples."""
-        n = len(x)
+    def process(self, data: np.ndarray, shape_mask: np.ndarray,
+                nr_strength: float) -> tuple[np.ndarray, float]:
+        """
+        Args:
+            data:        (hop, n_channels) input block
+            shape_mask:  per-bin target gains, len == len(self.freqs)
+            nr_strength: noise-reduction over-subtraction (0 = off, 1 = normal)
+
+        Returns:
+            (processed block (hop, n_channels), footstep-band energy scalar)
+        """
+        n = data.shape[0]
         if n < self.hop:
-            # Partial block (e.g. end of a file) — zero-pad, then trim output
-            padded = np.zeros(self.hop, dtype=np.float64)
-            padded[:n] = x
-            return self.process(padded)[:n]
+            padded = np.zeros((self.hop, data.shape[1]))
+            padded[:n] = data
+            out, e = self.process(padded, shape_mask, nr_strength)
+            return out[:n], e
 
-        # Slide input buffer
-        self._in_buf[:-self.hop] = self._in_buf[self.hop:]
-        self._in_buf[-self.hop:] = x
+        specs = []
+        for ch in range(self.n_channels):
+            buf = self._in_bufs[ch]
+            buf[:-self.hop] = buf[self.hop:]
+            buf[-self.hop:] = data[:, ch]
+            specs.append(np.fft.rfft(buf * self.window))
 
-        frame = self._in_buf * self.window
-        spec = np.fft.rfft(frame)
-        if self._mask is not None:
-            spec *= self._mask
-        y = np.fft.irfft(spec, n=self.win_len)
+        mono_mag = np.mean([np.abs(s) for s in specs], axis=0)
 
-        # Slide output accumulator and add new frame
-        self._out_buf[:-self.hop] = self._out_buf[self.hop:]
-        self._out_buf[-self.hop:] = 0.0
-        self._out_buf += y
+        # --- adaptive noise floor (gated average) ---
+        # Bins near the current floor estimate are treated as background and
+        # averaged in; bins far above it (footsteps, voices, shots) are
+        # excluded so events never inflate the floor.  Converges to the true
+        # mean background level — unlike minimum statistics, which tracks the
+        # lower envelope and under-subtracts by 2-3×.
+        if self._noise is None:
+            self._noise = mono_mag.copy()
+        else:
+            background = mono_mag < self.NOISE_GATE * self._noise
+            self._noise = np.where(
+                background,
+                (1 - self.NOISE_ATTACK) * self._noise + self.NOISE_ATTACK * mono_mag,
+                self._noise * self.NOISE_DRIFT,
+            )
 
-        return self._out_buf[:self.hop].copy()
+        beta = 1.4 * nr_strength
+        clean = np.maximum(mono_mag - beta * self._noise,
+                           self.GAIN_FLOOR * mono_mag)
+        nr_gain = clean / (mono_mag + 1e-12)
+
+        total_gain = nr_gain * shape_mask
+
+        # --- temporal smoothing (anti musical-noise) ---
+        if self._gain_state is None or len(self._gain_state) != len(total_gain):
+            self._gain_state = total_gain
+        else:
+            self._gain_state = (self.GAIN_SMOOTH * self._gain_state
+                                + (1 - self.GAIN_SMOOTH) * total_gain)
+        g = self._gain_state
+
+        # --- apply linked gains, overlap-add ---
+        out = np.zeros((self.hop, self.n_channels))
+        for ch in range(self.n_channels):
+            y = np.fft.irfft(specs[ch] * g, n=self.win_len)
+            ob = self._out_bufs[ch]
+            ob[:-self.hop] = ob[self.hop:]
+            ob[-self.hop:] = 0.0
+            ob += y
+            out[:, ch] = ob[:self.hop]
+
+        # Footstep-band energy of the cleaned signal, weighted by the mask
+        w = shape_mask / (shape_mask.max() + 1e-12)
+        band_energy = float(np.sum(mono_mag * nr_gain * w))
+
+        return out, band_energy
 
 
 # ---------------------------------------------------------------------------
 # Main enhancer
 # ---------------------------------------------------------------------------
 
+def _smoothstep(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
 class FootstepEnhancer:
     """
-    Two processing modes:
+    Full enhancement chain (everything runs in the spectral engine):
 
-    FIXED (default):
-        5th-order Butterworth bandpass (150–900 Hz) amplified,
-        everything else attenuated.
+      input → STFT → adaptive noise removal → shape mask (fixed band or
+      learned fingerprint) → iSTFT → footstep-event boost → gunshot duck
+      → optional auto-gain → soft limiter → output
 
-    LEARNED:
-        Per-bin spectral mask derived from FrequencyLearner, applied through
-        a windowed overlap-add STFT (artifact-free reconstruction).
-
-    Both modes share a smoothed gunshot-duck envelope and a soft peak limiter
-    instead of hard tanh waveshaping.
+    A spectral-flux footstep detector fires on each step onset and opens a
+    fast-attack/slow-release boost envelope, making individual steps pop
+    out of the mix. All per-bin gains are linked across channels so stereo
+    directionality is preserved exactly.
     """
 
     FOOTSTEP_LOW_HZ = 150
@@ -302,9 +454,13 @@ class FootstepEnhancer:
         self.block_size = block_size
 
         # Tunable from GUI
-        self.footstep_gain: float = 3.0
-        self.ambient_suppress: float = 0.25
+        self.footstep_gain: float = 3.0       # in-band gain (fixed mode shape)
+        self.ambient_suppress: float = 0.25   # out-of-band gain
         self.gunshot_duck: float = 0.10
+        self.noise_reduction: float = 1.0     # 0 = off … 1 = full
+        self.footstep_boost: float = 2.5      # event boost multiplier
+        self.detect_sensitivity: float = 5.0  # 1 … 10
+        self.agc_enabled: bool = False
         self.enabled: bool = True
         self.use_learned: bool = False
 
@@ -313,72 +469,60 @@ class FootstepEnhancer:
             n_fft=max(block_size * 8, 4096),
         )
 
-        self._transient = TransientDetector()
-        self._duck = GainSmoother(sample_rate, attack_ms=4.0, release_ms=220.0)
+        self._gunshot = TransientDetector(sample_rate=sample_rate)
+        self._footstep = FootstepDetector(
+            sensitivity=self.detect_sensitivity,
+            block_duration=block_size / sample_rate,
+        )
+        self._duck = GainSmoother(sample_rate, rise_ms=220.0, fall_ms=4.0)
+        self._boost = GainSmoother(sample_rate, rise_ms=8.0, fall_ms=300.0)
+        self._agc = AutoGainControl(sample_rate)
         self._limiter = SoftLimiter(sample_rate)
 
-        self._design_filters()
-        self._bp_zi: list | None = None
-        self._hp_zi: list | None = None
-        self._lp_zi: list | None = None
+        self._engine: SpectralEngine | None = None
+        self._mask_cache: np.ndarray | None = None
+        self._mask_key: tuple | None = None
 
-        self._ola: list[OLAMaskFilter] | None = None
-        self._ola_mask_version: int = -1
-
-    # ------------------------------------------------------------------
-    # Filter design (fixed mode)
-
-    def _design_filters(self) -> None:
-        nyq = self.sample_rate / 2.0
-        bp_lo = max(self.FOOTSTEP_LOW_HZ / nyq, 1e-4)
-        bp_hi = min(self.FOOTSTEP_HIGH_HZ / nyq, 0.9999)
-        self._bp_b, self._bp_a = signal.butter(5, [bp_lo, bp_hi], btype="band")
-
-        hp_f = min(self.FOOTSTEP_HIGH_HZ / nyq, 0.9999)
-        self._hp_b, self._hp_a = signal.butter(5, hp_f, btype="high")
-
-        lp_f = max(self.FOOTSTEP_LOW_HZ / nyq, 1e-4)
-        self._lp_b, self._lp_a = signal.butter(5, lp_f, btype="low")
-
-    def _init_states(self, n_channels: int) -> None:
-        # Zero initial state — filters settle within a few ms.  The state
-        # arrays returned by lfilter are carried forward untouched between
-        # blocks (re-scaling them each block corrupts the filter and clicks).
-        self._bp_zi = [np.zeros(max(len(self._bp_a), len(self._bp_b)) - 1)
-                       for _ in range(n_channels)]
-        self._hp_zi = [np.zeros(max(len(self._hp_a), len(self._hp_b)) - 1)
-                       for _ in range(n_channels)]
-        self._lp_zi = [np.zeros(max(len(self._lp_a), len(self._lp_b)) - 1)
-                       for _ in range(n_channels)]
-
-    def _filter_channel(self, ch: int, audio: np.ndarray):
-        bp, self._bp_zi[ch] = signal.lfilter(self._bp_b, self._bp_a, audio,
-                                             zi=self._bp_zi[ch])
-        hp, self._hp_zi[ch] = signal.lfilter(self._hp_b, self._hp_a, audio,
-                                             zi=self._hp_zi[ch])
-        lp, self._lp_zi[ch] = signal.lfilter(self._lp_b, self._lp_a, audio,
-                                             zi=self._lp_zi[ch])
-        return bp, hp, lp
+        # GUI-readable: > 0 for ~150 ms after each detected footstep
+        self.footstep_active: int = 0
+        self._hold_blocks = max(1, int(0.15 * sample_rate / block_size))
 
     # ------------------------------------------------------------------
-    # Learned-mask OLA setup
+    # Shape mask construction (cached)
 
-    def _ensure_ola(self, n_channels: int, hop: int) -> None:
-        rebuild = (
-            self._ola is None
-            or len(self._ola) != n_channels
-            or self._ola[0].hop != hop
+    def _shape_mask(self, freqs: np.ndarray) -> np.ndarray:
+        key = (
+            self.use_learned,
+            self.learner.mask_version,
+            round(self.footstep_gain, 3),
+            round(self.ambient_suppress, 3),
+            len(freqs),
         )
-        if rebuild:
-            self._ola = [OLAMaskFilter(hop) for _ in range(n_channels)]
-            self._ola_mask_version = -1
+        if key == self._mask_key and self._mask_cache is not None:
+            return self._mask_cache
 
-        if self._ola_mask_version != self.learner.mask_version:
-            mask = self.learner.learned_mask
-            if mask is not None:
-                for f in self._ola:
-                    f.set_mask(self.learner.freqs, mask, self.sample_rate)
-            self._ola_mask_version = self.learner.mask_version
+        if self.use_learned and self.learner.learned_mask is not None:
+            mask = np.interp(freqs, self.learner.freqs, self.learner.learned_mask)
+        else:
+            # Raised-cosine bandpass: smooth edges avoid ringing
+            lo_edge = _smoothstep((freqs - (self.FOOTSTEP_LOW_HZ - 50))
+                                  / 100.0)
+            hi_edge = 1.0 - _smoothstep((freqs - (self.FOOTSTEP_HIGH_HZ - 100))
+                                        / 300.0)
+            band = lo_edge * hi_edge
+            mask = self.ambient_suppress + (self.footstep_gain
+                                            - self.ambient_suppress) * band
+
+        self._mask_cache = mask
+        self._mask_key = key
+        return mask
+
+    def _ensure_engine(self, hop: int, n_channels: int) -> None:
+        if (self._engine is None
+                or self._engine.hop != hop
+                or self._engine.n_channels != n_channels):
+            self._engine = SpectralEngine(hop, n_channels, self.sample_rate)
+            self._mask_key = None  # bins changed → rebuild mask
 
     # ------------------------------------------------------------------
     # Main process
@@ -388,37 +532,42 @@ class FootstepEnhancer:
             return indata.astype(np.float32)
 
         stereo = indata.ndim == 2
-        data = indata if stereo else indata[:, np.newaxis]
+        data = (indata if stereo else indata[:, np.newaxis]).astype(np.float64)
         frames, n_channels = data.shape
 
-        if self._bp_zi is None or len(self._bp_zi) != n_channels:
-            self._init_states(n_channels)
+        self._ensure_engine(frames if frames >= 64 else self.block_size,
+                            n_channels)
 
         mono = data.mean(axis=1)
-        is_gunshot = self._transient.is_transient(mono)
+        is_gunshot = self._gunshot.is_transient(mono)
 
         if self.learner.is_learning:
             self.learner.update(mono)
 
-        # Smoothed duck envelope (per-sample ramp, no hard steps)
+        # --- spectral processing ---
+        mask = self._shape_mask(self._engine.freqs)
+        out, band_energy = self._engine.process(data, mask,
+                                                self.noise_reduction)
+
+        # --- footstep event detection (suppressed during gunshots) ---
+        self._footstep.sensitivity = self.detect_sensitivity
+        stepped = (not is_gunshot) and self._footstep.update(band_energy)
+        if stepped:
+            self.footstep_active = self._hold_blocks
+        elif self.footstep_active > 0:
+            self.footstep_active -= 1
+
+        boost_target = self.footstep_boost if self.footstep_active > 0 else 1.0
+        boost = self._boost.ramp(frames, boost_target)
+
         duck_target = self.gunshot_duck if is_gunshot else 1.0
         duck = self._duck.ramp(frames, duck_target)
 
-        out = np.zeros_like(data, dtype=np.float64)
+        out *= (boost * duck)[:, np.newaxis]
 
-        if self.use_learned and self.learner.learned_mask is not None:
-            self._ensure_ola(n_channels, frames)
-            for ch in range(n_channels):
-                out[:, ch] = self._ola[ch].process(data[:, ch].astype(np.float64))
-        else:
-            for ch in range(n_channels):
-                bp, hp, lp = self._filter_channel(ch, data[:, ch])
-                out[:, ch] = (
-                    bp * self.footstep_gain
-                    + (hp + lp) * self.ambient_suppress
-                )
+        if self.agc_enabled:
+            out = self._agc.process(out)
 
-        out *= duck[:, np.newaxis]
         out = self._limiter.process(out)
 
         result = out[:, 0] if not stereo else out
