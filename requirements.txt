@@ -1,0 +1,6 @@
+sounddevice==0.5.1
+numpy==2.2.6
+scipy==1.15.3
+librosa==0.11.0
+PyQt5==5.15.11
+pyqtgraph==0.13.7
