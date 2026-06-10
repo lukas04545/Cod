@@ -9,6 +9,99 @@ GUNSHOT_TRANSIENT_DB = -6  # dB above recent mean → classified as gunshot
 
 
 # ---------------------------------------------------------------------------
+# Step classifier (trained from the user's own learning session)
+# ---------------------------------------------------------------------------
+
+class StepClassifier:
+    """
+    Tiny logistic-regression classifier over normalised band-energy features.
+
+    Trained self-supervised during a learning session: frames captured within
+    the onset window of detected steps are positives, the remaining
+    moderate-energy frames are negatives.  At runtime it scores each onset
+    candidate's spectrum — a learned, game-specific replacement for the
+    fixed cosine-similarity fingerprint gate.
+
+    Features are level-invariant (energy-normalised log band energies), so
+    the classifier responds to spectral *shape*, not loudness, and works on
+    both raw learning spectra and noise-reduced runtime spectra.
+    """
+
+    N_BANDS = 24
+    F_LO = 60.0
+    F_HI = 6000.0
+
+    _band_edges = np.geomspace(F_LO, F_HI, N_BANDS + 1)
+
+    def __init__(self, w: np.ndarray, b: float,
+                 mu: np.ndarray, sd: np.ndarray):
+        self.w = w
+        self.b = b
+        self.mu = mu
+        self.sd = sd
+
+    # ------------------------------------------------------------------
+    # Features
+
+    @classmethod
+    def features(cls, mag: np.ndarray, freqs: np.ndarray) -> np.ndarray:
+        energy = mag ** 2
+        bands = np.empty(cls.N_BANDS)
+        for i in range(cls.N_BANDS):
+            sel = (freqs >= cls._band_edges[i]) & (freqs < cls._band_edges[i + 1])
+            bands[i] = float(np.sum(energy[sel]))
+        total = bands.sum() + 1e-12
+        return np.log(bands / total + 1e-6)
+
+    # ------------------------------------------------------------------
+    # Training
+
+    @classmethod
+    def train(cls, positives: list[np.ndarray], negatives: list[np.ndarray],
+              iters: int = 400, lr: float = 0.5, l2: float = 1e-3
+              ) -> "StepClassifier":
+        X = np.vstack(positives + negatives)
+        y = np.concatenate([np.ones(len(positives)), np.zeros(len(negatives))])
+
+        mu = X.mean(axis=0)
+        sd = X.std(axis=0) + 1e-9
+        Xs = (X - mu) / sd
+
+        # Balance classes so a flood of negatives can't drown the positives
+        n = len(y)
+        sw = np.where(y == 1, 0.5 * n / len(positives),
+                      0.5 * n / len(negatives))
+
+        w = np.zeros(X.shape[1])
+        b = 0.0
+        for _ in range(iters):
+            p = 1.0 / (1.0 + np.exp(-(Xs @ w + b)))
+            err = (p - y) * sw
+            w -= lr * (Xs.T @ err / n + l2 * w)
+            b -= lr * float(np.mean(err))
+        return cls(w, b, mu, sd)
+
+    # ------------------------------------------------------------------
+    # Inference
+
+    def predict(self, mag: np.ndarray, freqs: np.ndarray) -> float:
+        x = (self.features(mag, freqs) - self.mu) / self.sd
+        return float(1.0 / (1.0 + np.exp(-(x @ self.w + self.b))))
+
+    # ------------------------------------------------------------------
+    # Persistence
+
+    def to_dict(self) -> dict:
+        return {"w": self.w.tolist(), "b": self.b,
+                "mu": self.mu.tolist(), "sd": self.sd.tolist()}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "StepClassifier":
+        return cls(np.asarray(d["w"]), float(d["b"]),
+                   np.asarray(d["mu"]), np.asarray(d["sd"]))
+
+
+# ---------------------------------------------------------------------------
 # Frequency Learner
 # ---------------------------------------------------------------------------
 
@@ -37,12 +130,21 @@ class FrequencyLearner:
 
         self._accumulated = np.zeros(len(self.freqs))
         self._n_frames: int = 0
+        # Onset-gated accumulation: frames captured while a step onset is
+        # active build a much cleaner fingerprint than all moderate frames
+        self._onset_acc = np.zeros(len(self.freqs))
+        self._n_onset: int = 0
+        self._pos_mags: list[np.ndarray] = []
+        self._neg_mags: list[np.ndarray] = []
+        self._MAX_STORED = 3000  # ~32 s of frames; bounds memory
 
         # Outputs after finalize()
         self.learned_mask: np.ndarray | None = None
         self.mask_version: int = 0          # bumped on every finalize/reset
         self.peak_freqs: list[float] = []   # Hz
         self.avg_spectrum: np.ndarray = np.zeros(len(self.freqs))
+        self.classifier: StepClassifier | None = None
+        self.learned_from_onsets: bool = False
 
     # ------------------------------------------------------------------
     # Control
@@ -51,6 +153,10 @@ class FrequencyLearner:
         with self._lock:
             self._accumulated[:] = 0.0
             self._n_frames = 0
+            self._onset_acc[:] = 0.0
+            self._n_onset = 0
+            self._pos_mags = []
+            self._neg_mags = []
             self.is_learning = True
 
     def stop(self) -> None:
@@ -61,22 +167,39 @@ class FrequencyLearner:
         with self._lock:
             self._accumulated[:] = 0.0
             self._n_frames = 0
+            self._onset_acc[:] = 0.0
+            self._n_onset = 0
+            self._pos_mags = []
+            self._neg_mags = []
             self.is_learning = False
             self.learned_mask = None
             self.mask_version += 1
             self.peak_freqs = []
             self.avg_spectrum = np.zeros(len(self.freqs))
+            self.classifier = None
+            self.learned_from_onsets = False
 
     @property
     def frames_collected(self) -> int:
         with self._lock:
             return self._n_frames
 
+    @property
+    def onset_frames_collected(self) -> int:
+        with self._lock:
+            return self._n_onset
+
     # ------------------------------------------------------------------
     # Audio-thread update
 
-    def update(self, block: np.ndarray) -> None:
-        """Feed one mono audio block from the audio callback thread."""
+    def update(self, block: np.ndarray, onset_active: bool = False) -> None:
+        """
+        Feed one mono audio block from the audio callback thread.
+
+        onset_active: True while a footstep onset window is open — these
+        frames become the fingerprint and the classifier's positive
+        examples; the rest become negatives.
+        """
         if not self.is_learning:
             return
         rms = float(np.sqrt(np.mean(block ** 2)))
@@ -86,6 +209,14 @@ class FrequencyLearner:
         with self._lock:
             self._accumulated += mag
             self._n_frames += 1
+            if onset_active:
+                self._onset_acc += mag
+                self._n_onset += 1
+                if len(self._pos_mags) < self._MAX_STORED:
+                    self._pos_mags.append(mag)
+            else:
+                if len(self._neg_mags) < self._MAX_STORED:
+                    self._neg_mags.append(mag)
 
     # ------------------------------------------------------------------
     # Build mask
@@ -95,10 +226,28 @@ class FrequencyLearner:
         Called from GUI thread after learning stops.
         Returns the per-bin mask, or None if too few frames were captured.
         """
+        MIN_ONSET_FRAMES = 15
         with self._lock:
             if self._n_frames < 10:
                 return None
-            avg = self._accumulated / self._n_frames
+            # Prefer the onset-gated average: it contains only step sounds.
+            # Fall back to all moderate frames if too few onsets were caught.
+            self.learned_from_onsets = self._n_onset >= MIN_ONSET_FRAMES
+            pos_mags = list(self._pos_mags)
+            neg_mags = list(self._neg_mags)
+            if self.learned_from_onsets:
+                avg = self._onset_acc / self._n_onset
+            else:
+                avg = self._accumulated / self._n_frames
+
+        # Background subtraction: sounds present in BOTH onset and non-onset
+        # frames (music beds, tones, wind) are not step sounds.  Subtracting
+        # the non-onset average isolates what actually changes on each step —
+        # and mirrors the noise-reduced spectra the classifier sees at runtime.
+        background = (np.mean(neg_mags, axis=0) if neg_mags
+                      else np.zeros(len(self.freqs)))
+        if self.learned_from_onsets and neg_mags:
+            avg = np.maximum(avg - background, 0.0)
 
         # Smooth to suppress FFT noise without merging adjacent peaks.
         # Target ~70 Hz bandwidth so peaks 150 Hz apart remain distinct.
@@ -136,6 +285,18 @@ class FrequencyLearner:
         with self._lock:
             self.avg_spectrum = avg.copy()
 
+        # Train the step classifier when both classes have enough examples.
+        # Features are computed on background-subtracted spectra so they match
+        # the noise-reduced spectra used at inference time.
+        if len(pos_mags) >= MIN_ONSET_FRAMES and len(neg_mags) >= MIN_ONSET_FRAMES:
+            pos_feats = [StepClassifier.features(
+                np.maximum(m - background, 0.0), self.freqs) for m in pos_mags]
+            neg_feats = [StepClassifier.features(
+                np.maximum(m - background, 0.0), self.freqs) for m in neg_mags]
+            self.classifier = StepClassifier.train(pos_feats, neg_feats)
+        else:
+            self.classifier = None
+
         return mask
 
     def get_avg_spectrum(self) -> np.ndarray:
@@ -154,6 +315,9 @@ class FrequencyLearner:
             "mask": self.learned_mask.tolist(),
             "peak_freqs": self.peak_freqs,
             "avg_spectrum": self.avg_spectrum.tolist(),
+            "classifier": (self.classifier.to_dict()
+                           if self.classifier else None),
+            "learned_from_onsets": self.learned_from_onsets,
         }
         with open(path, "w") as f:
             json.dump(profile, f)
@@ -171,6 +335,10 @@ class FrequencyLearner:
         with self._lock:
             self.avg_spectrum = np.interp(self.freqs, src_freqs,
                                           np.asarray(profile["avg_spectrum"]))
+        clf = profile.get("classifier")
+        self.classifier = StepClassifier.from_dict(clf) if clf else None
+        self.learned_from_onsets = bool(profile.get("learned_from_onsets",
+                                                    False))
         self.mask_version += 1
 
 
@@ -641,9 +809,6 @@ class FootstepEnhancer:
         mono = data.mean(axis=1)
         is_gunshot = self._gunshot.is_transient(mono)
 
-        if self.learner.is_learning:
-            self.learner.update(mono)
-
         # --- spectral processing (boost from the previous block's detection;
         #     one-block lag is far below the boost envelope's time constants) ---
         mask = self._shape_mask(self._engine.freqs)
@@ -654,13 +819,25 @@ class FootstepEnhancer:
         self._footstep.sensitivity = self.detect_sensitivity
         stepped = (not is_gunshot) and self._footstep.update(band_energy)
 
-        # Fingerprint gate: with a learned profile, the onset spectrum must
-        # resemble actual footsteps — rejects reloads, grenade pins, etc.
-        if stepped and self.fingerprint_gate:
+        # Step gate: with a learned profile, the onset spectrum must resemble
+        # actual footsteps — rejects reloads, grenade pins, etc.  The trained
+        # classifier (if the learning session caught enough step onsets) is
+        # preferred; otherwise fall back to cosine fingerprint similarity.
+        # (gate bypassed while learning, so an old profile can't starve a
+        # new learning session of onset labels)
+        # The classifier and the cosine fingerprint catch different
+        # impostors (classifier: broadband bursts; cosine: tonal beeps),
+        # so when both exist the candidate must pass both.
+        if stepped and self.fingerprint_gate \
+                and not self.learner.is_learning \
+                and self._engine.last_clean_mag is not None:
+            clean_mag = self._engine.last_clean_mag
+            clf = self.learner.classifier
+            if clf is not None:
+                stepped = clf.predict(clean_mag, self._engine.freqs) > 0.5
             fp = self._fingerprint(self._engine.freqs)
-            if fp is not None and self._engine.last_clean_mag is not None:
-                stepped = self._matches_fingerprint(
-                    self._engine.last_clean_mag, fp)
+            if stepped and fp is not None:
+                stepped = self._matches_fingerprint(clean_mag, fp)
 
         if stepped:
             self.footstep_active = self._hold_blocks
@@ -671,6 +848,11 @@ class FootstepEnhancer:
                 self.last_direction = 0.0
         elif self.footstep_active > 0:
             self.footstep_active -= 1
+
+        # Feed the learner AFTER detection so onset frames are labelled:
+        # they form the fingerprint and the classifier's positive examples
+        if self.learner.is_learning:
+            self.learner.update(mono, onset_active=self.footstep_active > 0)
 
         # Smoothed band-boost scalar for the next block
         boost_target = self.footstep_boost if self.footstep_active > 0 else 1.0

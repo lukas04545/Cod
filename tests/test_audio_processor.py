@@ -251,6 +251,108 @@ def test_fingerprint_rejects_broadband():
     assert count_detections(flat_sig) <= 1
 
 
+def learn_live(enh, sig):
+    """Learn through the full process() path so onsets get labelled."""
+    stereo = np.column_stack([sig, sig])
+    enh.learner.start()
+    for i in range(0, len(sig) - HOP, HOP):
+        enh.process(stereo[i:i + HOP])
+    enh.learner.stop()
+    return enh.learner.finalize()
+
+
+def make_training_scene(seconds=8, tone_hz=1800, seed=11):
+    """Step bursts + a constant moderate tone (e.g. music bed)."""
+    rng = np.random.default_rng(seed)
+    n = seconds * FS
+    t = np.arange(n) / FS
+    tone = (0.03 * np.sin(2 * np.pi * tone_hz * t)).astype(np.float32)
+    sig = tone + (rng.standard_normal(n) * 0.01).astype(np.float32)
+    bs, as_ = sp.butter(4, [250 / (FS / 2), 700 / (FS / 2)], 'band')
+    for st in np.arange(0.5, seconds - 0.3, 0.45):
+        i0 = int(st * FS)
+        burst = sp.lfilter(bs, as_, rng.standard_normal(int(0.08 * FS)))
+        sig[i0:i0 + len(burst)] += (burst * np.exp(
+            -np.linspace(0, 5, len(burst))) * 0.4).astype(np.float32)
+    return sig
+
+
+def test_onset_gated_learning_excludes_background_tone():
+    """A constant tone playing during learning must not enter the
+    fingerprint when onset gating is active."""
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    sig = make_training_scene(tone_hz=1800)
+    assert learn_live(enh, sig) is not None
+    assert enh.learner.learned_from_onsets, "onset gating did not engage"
+    # The 1800 Hz tone must not be a learned peak
+    assert all(abs(p - 1800) > 150 for p in enh.learner.peak_freqs), \
+        f"background tone leaked into fingerprint: {enh.learner.peak_freqs}"
+    # The actual step band must be represented
+    assert any(200 < p < 800 for p in enh.learner.peak_freqs)
+
+
+def test_classifier_trained_and_discriminates():
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    learn_live(enh, make_training_scene())
+    clf = enh.learner.classifier
+    assert clf is not None, "classifier did not train"
+
+    freqs = enh.learner.freqs
+    # Footstep-shaped spectrum: energy concentrated 250-700 Hz
+    step_mag = np.exp(-0.5 * ((freqs - 450) / 150) ** 2)
+    # Broadband flat spectrum (reload click, static burst)
+    flat_mag = np.ones_like(freqs) * 0.1
+
+    p_step = clf.predict(step_mag, freqs)
+    p_flat = clf.predict(flat_mag, freqs)
+    assert p_step > 0.5, f"step score too low: {p_step:.2f}"
+    assert p_flat < 0.5, f"flat score too high: {p_flat:.2f}"
+
+
+def test_tonal_transients_rejected_after_learning():
+    """A beep-like tonal burst (e.g. hitmarker at 1800 Hz) produces a flux
+    onset but must be rejected by the combined classifier+fingerprint gate."""
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    learn_live(enh, make_training_scene())
+    assert enh.learner.classifier is not None
+
+    rng = np.random.default_rng(5)
+    n = 4 * FS
+    sig = (rng.standard_normal(n) * 0.008).astype(np.float32)
+    t = np.arange(int(0.1 * FS)) / FS
+    beep = (0.09 * np.sin(2 * np.pi * 1800 * t)
+            * np.exp(-np.linspace(0, 4, len(t)))).astype(np.float32)
+    for st in [1.0, 2.0, 3.0]:
+        i0 = int(st * FS)
+        sig[i0:i0 + len(beep)] += beep
+
+    stereo = np.column_stack([sig, sig])
+    det, prev = 0, 0
+    for i in range(0, n - HOP, HOP):
+        enh.process(stereo[i:i + HOP])
+        if enh.footstep_active == enh._hold_blocks and prev < enh.footstep_active:
+            det += 1
+        prev = enh.footstep_active
+    assert det <= 1, f"tonal beeps triggered {det} step detections"
+
+
+def test_profile_roundtrip_with_classifier(tmp_path):
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    learn_live(enh, make_training_scene())
+    assert enh.learner.classifier is not None
+    path = str(tmp_path / "p.json")
+    enh.learner.save_profile(path)
+
+    enh2 = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    enh2.learner.load_profile(path)
+    assert enh2.learner.classifier is not None
+    freqs = enh2.learner.freqs
+    mag = np.exp(-0.5 * ((freqs - 450) / 150) ** 2)
+    assert abs(enh2.learner.classifier.predict(mag, freqs)
+               - enh.learner.classifier.predict(mag, freqs)) < 1e-9
+    assert enh2.learner.learned_from_onsets == enh.learner.learned_from_onsets
+
+
 def test_profile_roundtrip(tmp_path):
     enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
     assert learn_from(enh, footstep_tones()) is not None

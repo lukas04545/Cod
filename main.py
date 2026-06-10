@@ -456,16 +456,22 @@ class MainWindow(QMainWindow):
             self._learn_status.setStyleSheet(f"color: {RED};")
             return
 
-        peaks = self._processor.learner.peak_freqs
-        avg   = self._processor.learner.avg_spectrum
-        self._spectrum_widget.update_spectrum(avg, mask, peaks)
+        learner = self._processor.learner
+        peaks = learner.peak_freqs
+        self._spectrum_widget.update_spectrum(learner.avg_spectrum, mask, peaks)
 
         peak_str = ",  ".join(f"{f:.0f} Hz" for f in peaks[:10])
         self._peak_label.setText(f"Learned peaks:  {peak_str}")
 
+        if learner.learned_from_onsets:
+            source = (f"{learner.onset_frames_collected} step-onset frames "
+                      f"(clean fingerprint)")
+        else:
+            source = (f"{learner.frames_collected} frames "
+                      f"(no clear step onsets — walk more during learning)")
+        clf_note = " AI step classifier trained." if learner.classifier else ""
         self._learn_status.setText(
-            f"Done! Learned {len(peaks)} frequency peaks from "
-            f"{self._processor.learner.frames_collected} frames. "
+            f"Done! {len(peaks)} peaks from {source}.{clf_note} "
             f"Enable \"Use learned frequencies\" to activate."
         )
         self._learn_status.setStyleSheet(f"color: {GREEN};")
