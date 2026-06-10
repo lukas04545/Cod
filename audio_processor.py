@@ -489,7 +489,9 @@ class FootstepDetector:
         self._refractory_blocks = max(1, int(self.REFRACTORY_S / block_duration))
         self._cooldown = 0
 
-    def update(self, band_energy: float) -> bool:
+    def update(self, band_energy: float, threshold_scale: float = 1.0) -> bool:
+        """threshold_scale > 1 (e.g. from the cadence tracker) lowers the
+        detection threshold, catching quieter steps."""
         flux = max(0.0, band_energy - self._prev_energy)
         self._prev_energy = band_energy
         self._energy_hist.append(band_energy)
@@ -500,12 +502,69 @@ class FootstepDetector:
         if len(self._energy_hist) < 15:
             return False
 
-        mean_energy = float(np.mean(self._energy_hist)) + 1e-9
-        c = 6.5 / max(self.sensitivity, 0.5)   # sens 5 → flux must be > 1.3× mean energy
-        if flux > c * mean_energy and band_energy > 1.2 * mean_energy:
+        # Median, not mean: robust to loud-step outliers in the history, so
+        # the threshold tracks the ambience floor and a quiet step is not
+        # penalised for following loud ones.
+        ref_energy = float(np.median(self._energy_hist)) + 1e-9
+        # sens 5, scale 1 → flux must be > 1.3× ambience energy
+        c = 6.5 / (max(self.sensitivity, 0.5) * threshold_scale)
+        if flux > c * ref_energy \
+                and band_energy > 1.1 * ref_energy / threshold_scale:
             self._cooldown = self._refractory_blocks
             return True
         return False
+
+
+class CadenceTracker:
+    """
+    Footsteps come in rhythm.  After two consistent inter-step intervals
+    (walking/sprinting cadence, 0.25-0.9 s), the tracker "locks" and raises
+    detector sensitivity inside the time window where the next step is due —
+    catching the quieter steps of a sequence that a fixed threshold misses.
+    """
+
+    MIN_T = 0.25      # shortest plausible step interval (sprint)
+    MAX_T = 0.90      # longest plausible step interval (slow walk)
+    CONSIST = 0.25    # max coefficient of variation to count as rhythmic
+    WINDOW = 0.30     # ± fraction of the predicted interval that counts as "due"
+    SENS_BOOST = 1.8  # threshold-scale applied while a step is due
+
+    def __init__(self, block_duration: float):
+        self.block_duration = block_duration
+        self._blocks_since = 10 ** 9
+        self._intervals: deque[float] = deque(maxlen=4)
+
+    def tick(self) -> None:
+        self._blocks_since = min(self._blocks_since + 1, 10 ** 9)
+        # Rhythm expires if no step arrives for far longer than expected
+        if self._intervals and \
+                self._blocks_since * self.block_duration > 2.0:
+            self._intervals.clear()
+
+    def on_step(self) -> None:
+        t = self._blocks_since * self.block_duration
+        if self.MIN_T <= t <= self.MAX_T:
+            self._intervals.append(t)
+        elif t > self.MAX_T:
+            self._intervals.clear()
+        self._blocks_since = 0
+
+    @property
+    def locked(self) -> bool:
+        if len(self._intervals) < 2:
+            return False
+        arr = np.asarray(self._intervals)
+        return float(arr.std() / (arr.mean() + 1e-12)) < self.CONSIST
+
+    def threshold_scale(self) -> float:
+        """> 1 while the next step of a locked rhythm is due."""
+        if not self.locked:
+            return 1.0
+        predicted = float(np.mean(self._intervals))
+        t = self._blocks_since * self.block_duration
+        if abs(t - predicted) <= self.WINDOW * predicted:
+            return self.SENS_BOOST
+        return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +613,8 @@ class SpectralEngine:
         self.last_clean_mag: np.ndarray | None = None
 
     def process(self, data: np.ndarray, shape_mask: np.ndarray,
-                nr_strength: float, band_boost: float = 1.0
+                nr_strength: float, band_boost: float = 1.0,
+                band_duck: float = 1.0
                 ) -> tuple[np.ndarray, float, list[float]]:
         """
         Args:
@@ -565,6 +625,8 @@ class SpectralEngine:
                          (footstep band) — boosting the band instead of the
                          whole signal keeps residual noise from pumping up
                          with each detected step.
+            band_duck:   sidechain gain for content OUTSIDE the band (< 1
+                         while a step is sounding, so the step stands alone).
 
         Returns:
             (processed block (hop, n_channels),
@@ -576,7 +638,7 @@ class SpectralEngine:
             padded = np.zeros((self.hop, data.shape[1]))
             padded[:n] = data
             out, e, ch_e = self.process(padded, shape_mask, nr_strength,
-                                        band_boost)
+                                        band_boost, band_duck)
             return out[:n], e, ch_e
 
         specs = []
@@ -623,7 +685,11 @@ class SpectralEngine:
                               self.GAIN_RISE, self.GAIN_FALL)
             self._gain_state = (smooth * self._gain_state
                                 + (1 - smooth) * total_gain)
-        g = self._gain_state
+        # Sidechain duck applied AFTER smoothing: band_duck is already driven
+        # by the smooth boost envelope, and the asymmetric per-bin smoothing
+        # (slow fall / fast rise) would otherwise delay the duck's onset and
+        # snap its release.
+        g = self._gain_state * (w + (1.0 - w) * band_duck)
 
         # --- apply linked gains, overlap-add ---
         out = np.zeros((self.hop, self.n_channels))
@@ -683,6 +749,9 @@ class FootstepEnhancer:
         self.noise_reduction: float = 1.0     # 0 = off … 1 = full
         self.footstep_boost: float = 2.5      # event boost multiplier
         self.detect_sensitivity: float = 5.0  # 1 … 10
+        self.step_sidechain: float = 0.35     # duck non-step content per step
+        self.direction_widen: float = 0.25    # exaggerate L/R during steps
+        self.cadence_enabled: bool = True     # rhythm-aware sensitivity
         self.agc_enabled: bool = False
         self.enabled: bool = True
         self.use_learned: bool = False
@@ -700,6 +769,8 @@ class FootstepEnhancer:
         self._duck = GainSmoother(sample_rate, rise_ms=220.0, fall_ms=4.0)
         self._agc = AutoGainControl(sample_rate)
         self._limiter = SoftLimiter(sample_rate)
+        self._cadence = CadenceTracker(block_size / sample_rate)
+        self._widen_prev: tuple[float, float] = (1.0, 1.0)
 
         self._engine: SpectralEngine | None = None
         self._mask_cache: np.ndarray | None = None
@@ -811,13 +882,23 @@ class FootstepEnhancer:
 
         # --- spectral processing (boost from the previous block's detection;
         #     one-block lag is far below the boost envelope's time constants) ---
+        # Normalised step envelope 0…1 drives sidechain and widening
+        step_env = float(np.clip(
+            (self._boost_state - 1.0) / max(self.footstep_boost - 1.0, 1e-6),
+            0.0, 1.0))
+        band_duck = 1.0 - self.step_sidechain * step_env
+
         mask = self._shape_mask(self._engine.freqs)
         out, band_energy, ch_energies = self._engine.process(
-            data, mask, self.noise_reduction, band_boost=self._boost_state)
+            data, mask, self.noise_reduction,
+            band_boost=self._boost_state, band_duck=band_duck)
 
         # --- footstep event detection (suppressed during gunshots) ---
+        self._cadence.tick()
+        scale = self._cadence.threshold_scale() if self.cadence_enabled else 1.0
         self._footstep.sensitivity = self.detect_sensitivity
-        stepped = (not is_gunshot) and self._footstep.update(band_energy)
+        stepped = (not is_gunshot) and self._footstep.update(
+            band_energy, threshold_scale=scale)
 
         # Step gate: with a learned profile, the onset spectrum must resemble
         # actual footsteps — rejects reloads, grenade pins, etc.  The trained
@@ -841,6 +922,7 @@ class FootstepEnhancer:
 
         if stepped:
             self.footstep_active = self._hold_blocks
+            self._cadence.on_step()
             if len(ch_energies) >= 2:
                 left, right = ch_energies[0], ch_energies[-1]
                 self.last_direction = (right - left) / (right + left + 1e-12)
@@ -864,6 +946,18 @@ class FootstepEnhancer:
         duck = self._duck.ramp(frames, duck_target)
 
         out *= duck[:, np.newaxis]
+
+        # --- direction widening: exaggerate the interaural level difference
+        #     while a step is sounding, making it easier to localise.
+        #     Gains ramp linearly across the block to avoid zipper noise. ---
+        if n_channels >= 2 and self.direction_widen > 0.0:
+            d = self.last_direction
+            a = 0.5 * self.direction_widen * step_env
+            gl_t, gr_t = 1.0 - a * d, 1.0 + a * d
+            gl0, gr0 = self._widen_prev
+            out[:, 0] *= np.linspace(gl0, gl_t, frames)
+            out[:, -1] *= np.linspace(gr0, gr_t, frames)
+            self._widen_prev = (gl_t, gr_t)
 
         if self.agc_enabled:
             out = self._agc.process(out)

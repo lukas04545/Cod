@@ -227,10 +227,25 @@ class MainWindow(QMainWindow):
         row2.addWidget(self._sens_w)
         ctrl_outer.addLayout(row2)
 
+        row3 = QHBoxLayout()
+        self._side_w, self._side_sl = _labeled_slider("Step Sidechain\n(% duck)", 0, 80, 35)
+        self._side_sl.valueChanged.connect(lambda v: setattr(self._processor, "step_sidechain", v / 100))
+        row3.addWidget(self._side_w)
+
+        self._widen_w, self._widen_sl = _labeled_slider("Direction Widen\n(%)", 0, 100, 25)
+        self._widen_sl.valueChanged.connect(lambda v: setattr(self._processor, "direction_widen", v / 100))
+        row3.addWidget(self._widen_w)
+        ctrl_outer.addLayout(row3)
+
         opt_row = QHBoxLayout()
         self._agc_cb = QCheckBox("Auto volume (brings distant quiet steps up)")
         self._agc_cb.stateChanged.connect(lambda s: setattr(self._processor, "agc_enabled", bool(s)))
         opt_row.addWidget(self._agc_cb)
+
+        self._cadence_cb = QCheckBox("Rhythm lock (anticipate next step)")
+        self._cadence_cb.setChecked(True)
+        self._cadence_cb.stateChanged.connect(lambda s: setattr(self._processor, "cadence_enabled", bool(s)))
+        opt_row.addWidget(self._cadence_cb)
 
         opt_row.addStretch()
 

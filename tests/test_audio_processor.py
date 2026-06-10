@@ -378,6 +378,126 @@ def test_save_without_profile_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Cadence, sidechain, widening
+# ---------------------------------------------------------------------------
+
+def test_cadence_tracker_locks_and_anticipates():
+    from audio_processor import CadenceTracker
+    block_dur = HOP / FS
+    ct = CadenceTracker(block_dur)
+    blocks_per_step = int(0.5 / block_dur)
+
+    # Three regular steps 0.5 s apart
+    for _ in range(3):
+        for _ in range(blocks_per_step):
+            ct.tick()
+        ct.on_step()
+    assert ct.locked
+
+    # Quarter period after the last step: not due yet
+    for _ in range(blocks_per_step // 4):
+        ct.tick()
+    assert ct.threshold_scale() == 1.0
+    # At the predicted time: due → raised sensitivity
+    for _ in range(blocks_per_step - blocks_per_step // 4):
+        ct.tick()
+    assert ct.threshold_scale() > 1.0
+    # Rhythm expires after a long silence
+    for _ in range(int(2.5 / block_dur)):
+        ct.tick()
+    assert not ct.locked
+
+
+def test_cadence_catches_quiet_steps():
+    """Loud steps establish a rhythm; following quiet steps in the same
+    rhythm are caught only with cadence enabled."""
+    rng = np.random.default_rng(13)
+    n = 8 * FS
+    amb = sp.lfilter(*sp.butter(2, 2000 / (FS / 2), 'low'),
+                     rng.standard_normal(n) * 0.05).astype(np.float32)
+    bs, as_ = sp.butter(4, [250 / (FS / 2), 700 / (FS / 2)], 'band')
+
+    def add_step(sig, t0, amp):
+        i0 = int(t0 * FS)
+        burst = sp.lfilter(bs, as_, rng.standard_normal(int(0.08 * FS)))
+        sig[i0:i0 + len(burst)] += (burst * np.exp(
+            -np.linspace(0, 5, len(burst))) * amp).astype(np.float32)
+
+    sig = amb.copy()
+    times = list(np.arange(0.5, 7.5, 0.5))
+    for i, t0 in enumerate(times):
+        add_step(sig, t0, 0.5 if i < 4 else 0.13)  # rhythm gets quiet
+
+    def detections(cadence):
+        enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+        enh.cadence_enabled = cadence
+        st = np.column_stack([sig, sig])
+        det, prev = 0, 0
+        for i in range(0, n - HOP, HOP):
+            enh.process(st[i:i + HOP])
+            if enh.footstep_active == enh._hold_blocks and prev < enh.footstep_active:
+                det += 1
+            prev = enh.footstep_active
+        return det
+
+    with_c, without_c = detections(True), detections(False)
+    assert with_c > without_c, \
+        f"cadence should catch extra steps ({with_c} vs {without_c})"
+
+
+def test_sidechain_ducks_out_of_band_during_steps():
+    rng = np.random.default_rng(17)
+    n = 6 * FS
+    t = np.arange(n) / FS
+    tone = (0.05 * np.sin(2 * np.pi * 3000 * t)).astype(np.float32)
+    sig = tone + (rng.standard_normal(n) * 0.005).astype(np.float32)
+    bs, as_ = sp.butter(4, [250 / (FS / 2), 700 / (FS / 2)], 'band')
+    step_times = []
+    for st in np.arange(0.8, 5.5, 0.7):
+        i0 = int(st * FS)
+        burst = sp.lfilter(bs, as_, rng.standard_normal(int(0.08 * FS)))
+        sig[i0:i0 + len(burst)] += (burst * np.exp(
+            -np.linspace(0, 5, len(burst))) * 0.4).astype(np.float32)
+        step_times.append(i0)
+
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    enh.noise_reduction = 0.0   # isolate the sidechain effect
+    enh.step_sidechain = 0.6
+    out = run(enh, np.column_stack([sig, sig]))[:, 0]
+
+    def tone_rms(seg):
+        b, a = sp.butter(4, [2700 / (FS / 2), 3300 / (FS / 2)], 'band')
+        return np.sqrt(np.mean(sp.lfilter(b, a, seg) ** 2))
+
+    win = int(0.1 * FS)
+    during = np.mean([tone_rms(out[s + HOP:s + HOP + win]) for s in step_times])
+    # 300 ms after each step: boost envelope mostly decayed
+    between = np.mean([tone_rms(out[s + HOP + 3 * win:s + HOP + 4 * win])
+                       for s in step_times])
+    assert during < between * 0.85, \
+        f"tone should duck during steps ({during:.5f} vs {between:.5f})"
+
+
+def test_direction_widening():
+    scene, step_times, _, _ = make_scene()
+    panned = np.column_stack([scene, scene * 0.5])  # steps on the left
+
+    def lr_ratio(widen):
+        enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+        enh.direction_widen = widen
+        out = run(enh, panned)
+        win = int(0.1 * FS)
+        l = np.mean([np.sqrt(np.mean(out[s + HOP:s + HOP + win, 0] ** 2))
+                     for s in step_times if s + HOP + win < len(out)])
+        r = np.mean([np.sqrt(np.mean(out[s + HOP:s + HOP + win, 1] ** 2))
+                     for s in step_times if s + HOP + win < len(out)])
+        return l / (r + 1e-12)
+
+    assert lr_ratio(1.0) > lr_ratio(0.0) * 1.1, \
+        "widening should exaggerate the L/R difference of left-panned steps"
+
+
+# ---------------------------------------------------------------------------
 # Performance
 # ---------------------------------------------------------------------------
 
