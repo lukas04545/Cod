@@ -1,0 +1,292 @@
+"""
+Regression suite for the footstep enhancer.  Run with:  python -m pytest
+"""
+import numpy as np
+import pytest
+from scipy import signal as sp
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from audio_processor import FootstepEnhancer, SpectralEngine
+
+FS = 48000
+HOP = 512
+
+
+# ---------------------------------------------------------------------------
+# Scene synthesis
+# ---------------------------------------------------------------------------
+
+def make_scene(seconds=6, steps=True, gunshots=False, seed=7):
+    rng = np.random.default_rng(seed)
+    n = seconds * FS
+    amb = sp.lfilter(*sp.butter(2, 2000 / (FS / 2), 'low'),
+                     rng.standard_normal(n) * 0.05)
+    sig = amb.copy()
+    step_times, shot_times = [], []
+    if steps:
+        bs, as_ = sp.butter(4, [250 / (FS / 2), 700 / (FS / 2)], 'band')
+        for st in np.arange(0.5, seconds - 0.3, 0.6):
+            i0 = int(st * FS)
+            burst = sp.lfilter(bs, as_, rng.standard_normal(int(0.08 * FS)))
+            sig[i0:i0 + len(burst)] += burst * np.exp(
+                -np.linspace(0, 5, len(burst))) * 0.5
+            step_times.append(i0)
+    if gunshots:
+        for st in [1.7, 3.7]:
+            i0 = int(st * FS)
+            crack = rng.standard_normal(int(0.12 * FS))
+            sig[i0:i0 + len(crack)] += crack * np.exp(
+                -np.linspace(0, 6, len(crack))) * 0.85
+            shot_times.append(i0)
+    return sig.astype(np.float32), step_times, amb.astype(np.float32), shot_times
+
+
+def run(enh, audio):
+    blocks = [enh.process(audio[i:i + HOP])
+              for i in range(0, len(audio) - HOP, HOP)]
+    return np.concatenate(blocks)
+
+
+def contrast(sig, times):
+    win = int(0.1 * FS)
+    s = np.mean([np.sqrt(np.mean(sig[t:t + win] ** 2))
+                 for t in times if t + win < len(sig)])
+    a = np.mean([np.sqrt(np.mean(sig[t - 2 * win:t - win] ** 2))
+                 for t in times if t > 2 * win])
+    return s / (a + 1e-12)
+
+
+def learn_from(enh, sig):
+    enh.learner.start()
+    for i in range(0, len(sig), HOP):
+        enh.learner.update(sig[i:i + HOP])
+    enh.learner.stop()
+    return enh.learner.finalize()
+
+
+# ---------------------------------------------------------------------------
+# Core engine
+# ---------------------------------------------------------------------------
+
+def test_engine_transparency():
+    eng = SpectralEngine(HOP, 1, FS)
+    ones = np.ones(len(eng.freqs))
+    t = np.linspace(0, 1, FS, endpoint=False)
+    sine = np.sin(2 * np.pi * 440 * t)
+    out = np.concatenate([eng.process(sine[i:i + HOP][:, None], ones, 0.0)[0]
+                          for i in range(0, FS, HOP)])[:, 0]
+    err = np.max(np.abs(out[HOP:][2048:40000] - sine[:-HOP][2048:40000]))
+    assert err < 5e-4  # < -66 dB
+
+
+def test_partial_block():
+    eng = SpectralEngine(HOP, 2, FS)
+    ones = np.ones(len(eng.freqs))
+    out, e, ch = eng.process(np.zeros((100, 2)), ones, 1.0)
+    assert out.shape == (100, 2)
+    assert len(ch) == 2
+
+
+# ---------------------------------------------------------------------------
+# Detection & enhancement
+# ---------------------------------------------------------------------------
+
+def test_footstep_detection_count():
+    scene, step_times, _, _ = make_scene()
+    stereo = np.column_stack([scene, scene])
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    detections, prev = 0, 0
+    for i in range(0, len(scene) - HOP, HOP):
+        enh.process(stereo[i:i + HOP])
+        if enh.footstep_active == enh._hold_blocks and prev < enh.footstep_active:
+            detections += 1
+        prev = enh.footstep_active
+    assert len(step_times) * 0.7 <= detections <= len(step_times) * 1.5
+
+
+def test_contrast_improvement():
+    scene, step_times, _, _ = make_scene()
+    stereo = np.column_stack([scene, scene])
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    out = run(enh, stereo)[:, 0]
+    assert contrast(out, [t + HOP for t in step_times]) \
+        > contrast(scene, step_times) * 2
+
+
+def test_gunshots_ducked_footsteps_not():
+    scene, step_times, _, shot_times = make_scene(gunshots=True)
+    step_times = [s for s in step_times
+                  if all(abs(s - g) > 0.3 * FS for g in shot_times)]
+    stereo = np.column_stack([scene, scene])
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    out = run(enh, stereo)[:, 0]
+    win = int(0.1 * FS)
+    shot_in = np.mean([np.sqrt(np.mean(scene[g:g + win] ** 2)) for g in shot_times])
+    shot_out = np.mean([np.sqrt(np.mean(out[g + HOP:g + HOP + win] ** 2))
+                        for g in shot_times])
+    step_in = np.mean([np.sqrt(np.mean(scene[s:s + win] ** 2)) for s in step_times])
+    step_out = np.mean([np.sqrt(np.mean(out[s + HOP:s + HOP + win] ** 2))
+                        for s in step_times if s + HOP + win < len(out)])
+    assert shot_out < shot_in * 0.5
+    assert step_out > step_in * 0.8
+
+
+def test_stereo_imaging_preserved():
+    scene, _, _, _ = make_scene()
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    out = run(enh, np.column_stack([scene, np.zeros_like(scene)]))
+    l = np.sqrt(np.mean(out[:, 0] ** 2))
+    r = np.sqrt(np.mean(out[:, 1] ** 2))
+    assert r < l * 0.01
+
+
+def test_ambience_suppressed():
+    _, _, amb, _ = make_scene()
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    out = run(enh, np.column_stack([amb, amb]))
+    red = (np.sqrt(np.mean(out[-2 * FS:, 0] ** 2))
+           / np.sqrt(np.mean(amb[-2 * FS:] ** 2)))
+    assert red < 0.55  # > 5 dB reduction of constant background
+
+
+def test_agc_raises_quiet_steps():
+    scene, step_times, _, _ = make_scene()
+    quiet = np.column_stack([scene, scene]) * 0.08
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    enh.agc_enabled = True
+    out = run(enh, quiet)
+    qi = np.mean([np.sqrt(np.mean(quiet[t:t + 4800, 0] ** 2)) for t in step_times])
+    qo = np.mean([np.sqrt(np.mean(out[t + HOP:t + HOP + 4800, 0] ** 2))
+                  for t in step_times if t + HOP + 4800 < len(out)])
+    assert qo > qi * 1.5
+
+
+def test_step_direction():
+    scene, step_times, _, _ = make_scene()
+    # Steps panned hard left
+    left = np.column_stack([scene, scene * 0.1])
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    directions = []
+    prev = 0
+    for i in range(0, len(scene) - HOP, HOP):
+        enh.process(left[i:i + HOP])
+        if enh.footstep_active == enh._hold_blocks and prev < enh.footstep_active:
+            directions.append(enh.last_direction)
+        prev = enh.footstep_active
+    assert directions, "no steps detected"
+    assert np.mean(directions) < -0.3  # clearly left
+
+
+# ---------------------------------------------------------------------------
+# Learning, fingerprint, profiles
+# ---------------------------------------------------------------------------
+
+def footstep_tones(seed=1):
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, 1, FS, endpoint=False)
+    return (0.12 * np.sin(2 * np.pi * 300 * t)
+            + 0.08 * np.sin(2 * np.pi * 550 * t)
+            + 0.06 * np.sin(2 * np.pi * 720 * t)
+            + 0.02 * rng.standard_normal(FS)).astype(np.float32)
+
+
+def test_learning_finds_peaks():
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    assert learn_from(enh, footstep_tones()) is not None
+    for tgt in [300, 550, 720]:
+        nearest = min(enh.learner.peak_freqs, key=lambda p: abs(p - tgt))
+        assert abs(nearest - tgt) < 60
+
+
+def test_fingerprint_rejects_broadband():
+    """With a learned profile, a moderate broadband transient (reload,
+    grenade pin) must NOT trigger the step boost, but a matching
+    band-limited transient must."""
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    # Learn from band-limited bursts (footstep-like)
+    rng = np.random.default_rng(3)
+    bs, as_ = sp.butter(4, [250 / (FS / 2), 700 / (FS / 2)], 'band')
+    train = np.zeros(4 * FS, dtype=np.float32)
+    for st in np.arange(0.3, 3.7, 0.4):
+        i0 = int(st * FS)
+        burst = sp.lfilter(bs, as_, rng.standard_normal(int(0.08 * FS)))
+        train[i0:i0 + len(burst)] += (burst * np.exp(
+            -np.linspace(0, 5, len(burst))) * 0.4).astype(np.float32)
+    assert learn_from(enh, train) is not None
+
+    def count_detections(sig):
+        e = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+        e.learner = enh.learner
+        st = np.column_stack([sig, sig])
+        det, prev = 0, 0
+        for i in range(0, len(sig) - HOP, HOP):
+            e.process(st[i:i + HOP])
+            if e.footstep_active == e._hold_blocks and prev < e.footstep_active:
+                det += 1
+            prev = e.footstep_active
+        return det
+
+    base = (rng.standard_normal(4 * FS) * 0.02).astype(np.float32)
+    base = sp.lfilter(*sp.butter(2, 2000 / (FS / 2), 'low'), base).astype(np.float32)
+
+    # Footstep-like bursts → should be detected
+    step_sig = base.copy()
+    for st in [1.0, 2.0, 3.0]:
+        i0 = int(st * FS)
+        burst = sp.lfilter(bs, as_, rng.standard_normal(int(0.08 * FS)))
+        step_sig[i0:i0 + len(burst)] += (burst * np.exp(
+            -np.linspace(0, 5, len(burst))) * 0.3).astype(np.float32)
+
+    # Broadband (flat) bursts at similar level → should be rejected
+    flat_sig = base.copy()
+    for st in [1.0, 2.0, 3.0]:
+        i0 = int(st * FS)
+        burst = rng.standard_normal(int(0.08 * FS))
+        flat_sig[i0:i0 + len(burst)] += (burst * np.exp(
+            -np.linspace(0, 5, len(burst))) * 0.08).astype(np.float32)
+
+    assert count_detections(step_sig) >= 2
+    assert count_detections(flat_sig) <= 1
+
+
+def test_profile_roundtrip(tmp_path):
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    assert learn_from(enh, footstep_tones()) is not None
+    path = str(tmp_path / "profile.json")
+    enh.learner.save_profile(path)
+
+    enh2 = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    enh2.learner.load_profile(path)
+    assert enh2.learner.learned_mask is not None
+    np.testing.assert_allclose(enh2.learner.learned_mask,
+                               enh.learner.learned_mask, rtol=1e-6)
+    assert enh2.learner.peak_freqs == enh.learner.peak_freqs
+    # Loaded profile must be usable immediately
+    enh2.use_learned = True
+    out = enh2.process(np.zeros((HOP, 2), dtype=np.float32))
+    assert out.shape == (HOP, 2)
+
+
+def test_save_without_profile_raises(tmp_path):
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    with pytest.raises(ValueError):
+        enh.learner.save_profile(str(tmp_path / "x.json"))
+
+
+# ---------------------------------------------------------------------------
+# Performance
+# ---------------------------------------------------------------------------
+
+def test_cpu_budget():
+    import time
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    blk = (np.random.default_rng(0).standard_normal((HOP, 2)) * 0.2
+           ).astype(np.float32)
+    enh.process(blk)  # warm-up
+    start = time.perf_counter()
+    for _ in range(300):
+        enh.process(blk)
+    per_block_ms = (time.perf_counter() - start) / 300 * 1000
+    assert per_block_ms < 5  # budget is 10.7 ms

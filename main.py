@@ -15,9 +15,9 @@ import sys
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QGroupBox, QHBoxLayout, QLabel,
+    QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QMainWindow, QProgressBar, QPushButton, QSlider, QVBoxLayout,
-    QWidget, QCheckBox, QSizePolicy,
+    QWidget, QCheckBox,
 )
 from PyQt5.QtGui import QPalette, QColor
 import pyqtgraph as pg
@@ -276,6 +276,16 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self._use_learned_cb)
         learn_lay.addLayout(btn_row)
 
+        profile_row = QHBoxLayout()
+        save_btn = QPushButton("Save Profile…")
+        save_btn.clicked.connect(self._on_save_profile)
+        profile_row.addWidget(save_btn)
+        load_btn = QPushButton("Load Profile…")
+        load_btn.clicked.connect(self._on_load_profile)
+        profile_row.addWidget(load_btn)
+        profile_row.addStretch()
+        learn_lay.addLayout(profile_row)
+
         self._learn_status = QLabel("Status: not started")
         self._learn_status.setStyleSheet(f"color: {GREY};")
         learn_lay.addWidget(self._learn_status)
@@ -477,6 +487,45 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background: #227722; }"
         )
 
+    def _on_save_profile(self) -> None:
+        if self._processor.learner.learned_mask is None:
+            self._learn_status.setText("Nothing to save — learn footsteps first.")
+            self._learn_status.setStyleSheet(f"color: {RED};")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save footstep profile", "footstep_profile.json",
+            "Profile (*.json)")
+        if not path:
+            return
+        try:
+            self._processor.learner.save_profile(path)
+            self._learn_status.setText(f"Profile saved: {path}")
+            self._learn_status.setStyleSheet(f"color: {GREEN};")
+        except Exception as exc:
+            self._learn_status.setText(f"Save failed: {exc}")
+            self._learn_status.setStyleSheet(f"color: {RED};")
+
+    def _on_load_profile(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load footstep profile", "", "Profile (*.json)")
+        if not path:
+            return
+        try:
+            learner = self._processor.learner
+            learner.load_profile(path)
+            self._spectrum_widget.update_spectrum(
+                learner.avg_spectrum, learner.learned_mask, learner.peak_freqs)
+            peak_str = ",  ".join(f"{f:.0f} Hz" for f in learner.peak_freqs[:10])
+            self._peak_label.setText(f"Loaded peaks:  {peak_str}")
+            self._use_learned_cb.setEnabled(True)
+            self._learn_status.setText(
+                f"Profile loaded ({len(learner.peak_freqs)} peaks). "
+                "Enable \"Use learned frequencies\" to activate.")
+            self._learn_status.setStyleSheet(f"color: {GREEN};")
+        except Exception as exc:
+            self._learn_status.setText(f"Load failed: {exc}")
+            self._learn_status.setStyleSheet(f"color: {RED};")
+
     def _on_use_learned(self, state: int) -> None:
         enabled = bool(state)
         self._processor.use_learned = enabled
@@ -496,9 +545,13 @@ class MainWindow(QMainWindow):
             self._vu_in.setValue(int(min(self._engine.vu_in * 300, 100)))
             self._vu_out.setValue(int(min(self._engine.vu_out * 300, 100)))
             if self._processor.footstep_active > 0:
+                d = self._processor.last_direction
+                arrow = "◀" if d < -0.15 else ("▶" if d > 0.15 else "▲")
+                self._step_indicator.setText(f"● STEP {arrow}")
                 self._step_indicator.setStyleSheet(
                     f"color: {GREEN}; font-weight: bold; font-size: 14px;")
             else:
+                self._step_indicator.setText("● STEP")
                 self._step_indicator.setStyleSheet(
                     "color: #333; font-weight: bold; font-size: 14px;")
         else:

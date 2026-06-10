@@ -1,3 +1,4 @@
+import json
 import numpy as np
 from scipy.signal import find_peaks, savgol_filter, windows
 from collections import deque
@@ -140,6 +141,37 @@ class FrequencyLearner:
     def get_avg_spectrum(self) -> np.ndarray:
         with self._lock:
             return self._accumulated / max(self._n_frames, 1)
+
+    # ------------------------------------------------------------------
+    # Profile persistence (per game / map)
+
+    def save_profile(self, path: str) -> None:
+        if self.learned_mask is None:
+            raise ValueError("No learned profile to save")
+        profile = {
+            "sample_rate": self.sample_rate,
+            "n_fft": self.n_fft,
+            "mask": self.learned_mask.tolist(),
+            "peak_freqs": self.peak_freqs,
+            "avg_spectrum": self.avg_spectrum.tolist(),
+        }
+        with open(path, "w") as f:
+            json.dump(profile, f)
+
+    def load_profile(self, path: str) -> None:
+        with open(path) as f:
+            profile = json.load(f)
+        # Re-interpolate onto our own bins in case the profile was saved
+        # with a different FFT size or sample rate
+        src_freqs = np.fft.rfftfreq(profile["n_fft"],
+                                    1.0 / profile["sample_rate"])
+        self.learned_mask = np.interp(self.freqs, src_freqs,
+                                      np.asarray(profile["mask"]))
+        self.peak_freqs = [float(p) for p in profile["peak_freqs"]]
+        with self._lock:
+            self.avg_spectrum = np.interp(self.freqs, src_freqs,
+                                          np.asarray(profile["avg_spectrum"]))
+        self.mask_version += 1
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +365,11 @@ class SpectralEngine:
     NOISE_DRIFT = 1.0005     # slow upward drift while gated (handles level rises)
     NOISE_GATE = 2.5         # bins louder than gate×floor are "events", not noise
     GAIN_FLOOR = 0.10        # never attenuate a bin below 10 % (less musical noise)
-    GAIN_SMOOTH = 0.55       # temporal smoothing of per-bin gains
+    # Asymmetric temporal gain smoothing: gains open almost instantly so the
+    # sharp attack of a step is not dulled, but close slowly so noise between
+    # events doesn't flutter (musical noise).
+    GAIN_RISE = 0.30         # state weight when gain is increasing (fast open)
+    GAIN_FALL = 0.75         # state weight when gain is decreasing (slow close)
 
     def __init__(self, hop: int, n_channels: int, sample_rate: int):
         self.hop = hop
@@ -347,24 +383,33 @@ class SpectralEngine:
         self._out_bufs = [np.zeros(self.win_len) for _ in range(n_channels)]
         self._noise: np.ndarray | None = None
         self._gain_state: np.ndarray | None = None
+        self.last_clean_mag: np.ndarray | None = None
 
     def process(self, data: np.ndarray, shape_mask: np.ndarray,
-                nr_strength: float) -> tuple[np.ndarray, float]:
+                nr_strength: float, band_boost: float = 1.0
+                ) -> tuple[np.ndarray, float, list[float]]:
         """
         Args:
             data:        (hop, n_channels) input block
             shape_mask:  per-bin target gains, len == len(self.freqs)
             nr_strength: noise-reduction over-subtraction (0 = off, 1 = normal)
+            band_boost:  extra gain applied only where the mask is strong
+                         (footstep band) — boosting the band instead of the
+                         whole signal keeps residual noise from pumping up
+                         with each detected step.
 
         Returns:
-            (processed block (hop, n_channels), footstep-band energy scalar)
+            (processed block (hop, n_channels),
+             footstep-band energy scalar,
+             per-channel band energies — for direction estimation)
         """
         n = data.shape[0]
         if n < self.hop:
             padded = np.zeros((self.hop, data.shape[1]))
             padded[:n] = data
-            out, e = self.process(padded, shape_mask, nr_strength)
-            return out[:n], e
+            out, e, ch_e = self.process(padded, shape_mask, nr_strength,
+                                        band_boost)
+            return out[:n], e, ch_e
 
         specs = []
         for ch in range(self.n_channels):
@@ -391,19 +436,25 @@ class SpectralEngine:
                 self._noise * self.NOISE_DRIFT,
             )
 
-        beta = 1.4 * nr_strength
+        beta = 1.7 * nr_strength
         clean = np.maximum(mono_mag - beta * self._noise,
                            self.GAIN_FLOOR * mono_mag)
         nr_gain = clean / (mono_mag + 1e-12)
 
-        total_gain = nr_gain * shape_mask
+        # Band-limited boost: scale only where the mask is strong
+        w = shape_mask / (shape_mask.max() + 1e-12)
+        boosted_mask = shape_mask * (1.0 + (band_boost - 1.0) * w)
 
-        # --- temporal smoothing (anti musical-noise) ---
+        total_gain = nr_gain * boosted_mask
+
+        # --- asymmetric temporal smoothing (anti musical-noise) ---
         if self._gain_state is None or len(self._gain_state) != len(total_gain):
             self._gain_state = total_gain
         else:
-            self._gain_state = (self.GAIN_SMOOTH * self._gain_state
-                                + (1 - self.GAIN_SMOOTH) * total_gain)
+            smooth = np.where(total_gain > self._gain_state,
+                              self.GAIN_RISE, self.GAIN_FALL)
+            self._gain_state = (smooth * self._gain_state
+                                + (1 - smooth) * total_gain)
         g = self._gain_state
 
         # --- apply linked gains, overlap-add ---
@@ -417,10 +468,14 @@ class SpectralEngine:
             out[:, ch] = ob[:self.hop]
 
         # Footstep-band energy of the cleaned signal, weighted by the mask
-        w = shape_mask / (shape_mask.max() + 1e-12)
         band_energy = float(np.sum(mono_mag * nr_gain * w))
+        ch_energies = [float(np.sum(np.abs(specs[ch]) * nr_gain * w))
+                       for ch in range(self.n_channels)]
 
-        return out, band_energy
+        # Cleaned mono spectrum, used for fingerprint matching upstream
+        self.last_clean_mag = mono_mag * nr_gain
+
+        return out, band_energy, ch_energies
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +530,6 @@ class FootstepEnhancer:
             block_duration=block_size / sample_rate,
         )
         self._duck = GainSmoother(sample_rate, rise_ms=220.0, fall_ms=4.0)
-        self._boost = GainSmoother(sample_rate, rise_ms=8.0, fall_ms=300.0)
         self._agc = AutoGainControl(sample_rate)
         self._limiter = SoftLimiter(sample_rate)
 
@@ -483,8 +537,22 @@ class FootstepEnhancer:
         self._mask_cache: np.ndarray | None = None
         self._mask_key: tuple | None = None
 
-        # GUI-readable: > 0 for ~150 ms after each detected footstep
-        self.footstep_active: int = 0
+        # Per-block smoothed band-boost scalar (applied in spectral domain)
+        self._boost_state: float = 1.0
+        block_s = block_size / sample_rate
+        self._boost_rise = float(np.exp(-block_s / 0.010))   # ~10 ms attack
+        self._boost_fall = float(np.exp(-block_s / 0.300))   # ~300 ms release
+
+        # Fingerprint matching (rejects non-footstep transients)
+        self.fingerprint_gate: bool = True
+        self.fingerprint_threshold: float = 0.60
+        self._fp_cache: np.ndarray | None = None
+        self._fp_region: np.ndarray | None = None
+        self._fp_version: int = -1
+
+        # GUI-readable state
+        self.footstep_active: int = 0          # > 0 for ~150 ms after a step
+        self.last_direction: float = 0.0       # -1 = left … +1 = right
         self._hold_blocks = max(1, int(0.15 * sample_rate / block_size))
 
     # ------------------------------------------------------------------
@@ -523,6 +591,38 @@ class FootstepEnhancer:
                 or self._engine.n_channels != n_channels):
             self._engine = SpectralEngine(hop, n_channels, self.sample_rate)
             self._mask_key = None  # bins changed → rebuild mask
+            self._fp_version = -1
+
+    # ------------------------------------------------------------------
+    # Footstep fingerprint (cached unit vector of the learned spectrum)
+
+    def _fingerprint(self, freqs: np.ndarray) -> np.ndarray | None:
+        if self.learner.learned_mask is None:
+            return None
+        if self._fp_version == self.learner.mask_version \
+                and self._fp_cache is not None:
+            return self._fp_cache
+
+        fp = np.interp(freqs, self.learner.freqs, self.learner.avg_spectrum)
+        region = (freqs >= 80.0) & (freqs <= 2000.0)
+        fp = fp * region
+        norm = float(np.linalg.norm(fp))
+        if norm < 1e-9:
+            self._fp_cache = None
+        else:
+            self._fp_cache = fp / norm
+        self._fp_region = region
+        self._fp_version = self.learner.mask_version
+        return self._fp_cache
+
+    def _matches_fingerprint(self, clean_mag: np.ndarray,
+                             fp: np.ndarray) -> bool:
+        cur = clean_mag * self._fp_region
+        norm = float(np.linalg.norm(cur))
+        if norm < 1e-9:
+            return False
+        similarity = float(np.dot(cur / norm, fp))
+        return similarity >= self.fingerprint_threshold
 
     # ------------------------------------------------------------------
     # Main process
@@ -544,26 +644,44 @@ class FootstepEnhancer:
         if self.learner.is_learning:
             self.learner.update(mono)
 
-        # --- spectral processing ---
+        # --- spectral processing (boost from the previous block's detection;
+        #     one-block lag is far below the boost envelope's time constants) ---
         mask = self._shape_mask(self._engine.freqs)
-        out, band_energy = self._engine.process(data, mask,
-                                                self.noise_reduction)
+        out, band_energy, ch_energies = self._engine.process(
+            data, mask, self.noise_reduction, band_boost=self._boost_state)
 
         # --- footstep event detection (suppressed during gunshots) ---
         self._footstep.sensitivity = self.detect_sensitivity
         stepped = (not is_gunshot) and self._footstep.update(band_energy)
+
+        # Fingerprint gate: with a learned profile, the onset spectrum must
+        # resemble actual footsteps — rejects reloads, grenade pins, etc.
+        if stepped and self.fingerprint_gate:
+            fp = self._fingerprint(self._engine.freqs)
+            if fp is not None and self._engine.last_clean_mag is not None:
+                stepped = self._matches_fingerprint(
+                    self._engine.last_clean_mag, fp)
+
         if stepped:
             self.footstep_active = self._hold_blocks
+            if len(ch_energies) >= 2:
+                left, right = ch_energies[0], ch_energies[-1]
+                self.last_direction = (right - left) / (right + left + 1e-12)
+            else:
+                self.last_direction = 0.0
         elif self.footstep_active > 0:
             self.footstep_active -= 1
 
+        # Smoothed band-boost scalar for the next block
         boost_target = self.footstep_boost if self.footstep_active > 0 else 1.0
-        boost = self._boost.ramp(frames, boost_target)
+        coef = self._boost_rise if boost_target > self._boost_state \
+            else self._boost_fall
+        self._boost_state = coef * self._boost_state + (1 - coef) * boost_target
 
         duck_target = self.gunshot_duck if is_gunshot else 1.0
         duck = self._duck.ramp(frames, duck_target)
 
-        out *= (boost * duck)[:, np.newaxis]
+        out *= duck[:, np.newaxis]
 
         if self.agc_enabled:
             out = self._agc.process(out)
