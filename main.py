@@ -2,36 +2,28 @@
 CoD Footstep Enhancer — GUI entry point.
 
 Requirements:
-  pip install sounddevice numpy scipy librosa PyQt5 pyqtgraph
+  pip install sounddevice numpy scipy PyQt5 pyqtgraph
 
 Audio routing (Windows):  Install VB-Cable or Voicemeeter.
-  Game  →  VB-Cable Input  →  this app (select VB-Cable Output as input here)
-  This app output  →  your headphones / speakers
+  Game  →  VB-Cable Input  →  this app (pick "CABLE Output" as Input here)
+  This app output  →  headphones / speakers
 
 Audio routing (Linux):  Use PulseAudio/PipeWire virtual sinks.
 """
 
 import sys
-import threading
+import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QProgressBar,
-    QPushButton,
-    QSlider,
-    QVBoxLayout,
-    QWidget,
-    QCheckBox,
+    QApplication, QComboBox, QGroupBox, QHBoxLayout, QLabel,
+    QMainWindow, QProgressBar, QPushButton, QSlider, QVBoxLayout,
+    QWidget, QCheckBox, QSizePolicy,
 )
 from PyQt5.QtGui import QPalette, QColor
+import pyqtgraph as pg
 
 from audio_processor import FootstepEnhancer
-from device_manager import input_devices, output_devices, AudioDevice
+from device_manager import input_devices, output_devices
 from stream_engine import StreamEngine
 
 
@@ -39,46 +31,125 @@ from stream_engine import StreamEngine
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_slider(min_val: int, max_val: int, default: int, label: str, parent=None):
-    """Return (QSlider, QLabel-value) tuple with a descriptor label above."""
-    container = QWidget(parent)
-    layout = QVBoxLayout(container)
-    layout.setContentsMargins(0, 0, 0, 0)
+ORANGE = "#ff6600"
+GREEN  = "#00cc66"
+RED    = "#ff4444"
+GREY   = "#888888"
+
+
+def _labeled_slider(label: str, lo: int, hi: int, default: int):
+    """Return (outer QWidget, QSlider)."""
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(2)
 
     title = QLabel(label)
     title.setAlignment(Qt.AlignCenter)
-    layout.addWidget(title)
+    lay.addWidget(title)
 
-    slider = QSlider(Qt.Horizontal)
-    slider.setMinimum(min_val)
-    slider.setMaximum(max_val)
-    slider.setValue(default)
-    layout.addWidget(slider)
+    sl = QSlider(Qt.Horizontal)
+    sl.setMinimum(lo)
+    sl.setMaximum(hi)
+    sl.setValue(default)
+    lay.addWidget(sl)
 
-    value_lbl = QLabel(str(default))
-    value_lbl.setAlignment(Qt.AlignCenter)
-    layout.addWidget(value_lbl)
+    val_lbl = QLabel(str(default))
+    val_lbl.setAlignment(Qt.AlignCenter)
+    lay.addWidget(val_lbl)
 
-    slider.valueChanged.connect(lambda v: value_lbl.setText(str(v)))
-    return container, slider
+    sl.valueChanged.connect(lambda v: val_lbl.setText(str(v)))
+    return w, sl
+
+
+# ---------------------------------------------------------------------------
+# Spectrum widget
+# ---------------------------------------------------------------------------
+
+class SpectrumWidget(pg.PlotWidget):
+    """Shows learned average spectrum + amplification mask."""
+
+    def __init__(self, freqs: np.ndarray):
+        super().__init__()
+        self.freqs = freqs
+        self.setBackground("#1a1a1a")
+        self.setLabel("bottom", "Frequency", units="Hz")
+        self.setLabel("left", "Amplitude")
+        self.setXRange(20, 8000)
+        self.showGrid(x=True, y=True, alpha=0.3)
+        self.setMinimumHeight(180)
+
+        self._spectrum_curve = self.plot(pen=pg.mkPen("#00aaff", width=1.5), name="Captured spectrum")
+        self._mask_curve     = self.plot(pen=pg.mkPen(ORANGE, width=2.0),    name="Learned mask")
+        self._peak_lines: list[pg.InfiniteLine] = []
+
+        legend = self.addLegend(offset=(10, 10))
+        legend.addItem(self._spectrum_curve, "Captured spectrum")
+        legend.addItem(self._mask_curve,     "Amplification mask")
+
+    def update_spectrum(self, avg_spectrum: np.ndarray, mask: np.ndarray | None,
+                        peak_freqs: list[float]) -> None:
+        norm = avg_spectrum.max() + 1e-9
+        self._spectrum_curve.setData(self.freqs, avg_spectrum / norm)
+
+        if mask is not None:
+            norm_mask = mask.max() + 1e-9
+            self._mask_curve.setData(self.freqs, mask / norm_mask)
+        else:
+            self._mask_curve.setData([], [])
+
+        for line in self._peak_lines:
+            self.removeItem(line)
+        self._peak_lines.clear()
+
+        for f in peak_freqs:
+            line = pg.InfiniteLine(
+                pos=f, angle=90,
+                pen=pg.mkPen(GREEN, width=1, style=Qt.DashLine),
+                label=f"{f:.0f}Hz",
+                labelOpts={"color": GREEN, "position": 0.95},
+            )
+            self.addItem(line)
+            self._peak_lines.append(line)
+
+    def clear_all(self) -> None:
+        self._spectrum_curve.setData([], [])
+        self._mask_curve.setData([], [])
+        for line in self._peak_lines:
+            self.removeItem(line)
+        self._peak_lines.clear()
 
 
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
+LEARN_SECONDS = 8   # how long the auto-stop timer runs
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("CoD Footstep Enhancer — AI Audio Filter")
-        self.setMinimumWidth(680)
+        self.setMinimumWidth(720)
 
         self._processor = FootstepEnhancer()
         self._engine: StreamEngine | None = None
+        self._learn_ticks = 0
 
         self._build_ui()
         self._apply_dark_theme()
-        self._start_vu_timer()
+
+        # VU meter refresh (20 fps)
+        self._vu_timer = QTimer(self)
+        self._vu_timer.setInterval(50)
+        self._vu_timer.timeout.connect(self._update_vu)
+        self._vu_timer.start()
+
+        # Learning countdown + live spectrum update (4 fps)
+        self._learn_timer = QTimer(self)
+        self._learn_timer.setInterval(250)
+        self._learn_timer.timeout.connect(self._learn_tick)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -88,118 +159,152 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setSpacing(12)
+        root.setSpacing(10)
 
-        # --- Header ---
-        header = QLabel("🎮  CoD Footstep Enhancer")
-        header.setStyleSheet("font-size: 20px; font-weight: bold; color: #ff6600;")
-        header.setAlignment(Qt.AlignCenter)
-        root.addWidget(header)
+        # Header
+        hdr = QLabel("CoD Footstep Enhancer")
+        hdr.setStyleSheet(f"font-size: 20px; font-weight: bold; color: {ORANGE};")
+        hdr.setAlignment(Qt.AlignCenter)
+        root.addWidget(hdr)
 
-        subtitle = QLabel(
-            "Amplifies footstep frequencies (150–900 Hz) · Ducks gunshots · Suppresses ambience"
-        )
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setStyleSheet("color: #aaa; font-size: 11px;")
-        root.addWidget(subtitle)
+        sub = QLabel("Learns exact footstep frequencies · Ducks gunshots · Suppresses ambience")
+        sub.setAlignment(Qt.AlignCenter)
+        sub.setStyleSheet("color: #aaa; font-size: 11px;")
+        root.addWidget(sub)
 
-        # --- Device selection ---
-        dev_group = QGroupBox("Audio Devices")
-        dev_layout = QVBoxLayout(dev_group)
+        # --- Devices ---
+        dev_grp = QGroupBox("Audio Devices")
+        dev_lay = QVBoxLayout(dev_grp)
 
         in_row = QHBoxLayout()
         in_row.addWidget(QLabel("Input (game audio):"))
         self._in_combo = QComboBox()
         in_row.addWidget(self._in_combo, 1)
-        dev_layout.addLayout(in_row)
+        dev_lay.addLayout(in_row)
 
         out_row = QHBoxLayout()
         out_row.addWidget(QLabel("Output (headphones):"))
         self._out_combo = QComboBox()
         out_row.addWidget(self._out_combo, 1)
-        dev_layout.addLayout(out_row)
+        dev_lay.addLayout(out_row)
 
-        self._refresh_btn = QPushButton("↺ Refresh Devices")
-        self._refresh_btn.clicked.connect(self._populate_devices)
-        dev_layout.addWidget(self._refresh_btn)
+        refresh_btn = QPushButton("Refresh Devices")
+        refresh_btn.clicked.connect(self._populate_devices)
+        dev_lay.addWidget(refresh_btn)
 
-        root.addWidget(dev_group)
+        root.addWidget(dev_grp)
         self._populate_devices()
 
         # --- Controls ---
-        ctrl_group = QGroupBox("Enhancement Controls")
-        ctrl_layout = QHBoxLayout(ctrl_group)
+        ctrl_grp = QGroupBox("Enhancement Controls")
+        ctrl_lay = QHBoxLayout(ctrl_grp)
 
-        self._footstep_widget, self._footstep_slider = make_slider(
-            10, 100, 40, "Footstep Gain\n(10–100×0.1)"
+        self._gain_w, self._gain_sl = _labeled_slider("Footstep Gain\n(×0.1)", 10, 120, 40)
+        self._gain_sl.valueChanged.connect(lambda v: setattr(self._processor, "footstep_gain", v * 0.1))
+        ctrl_lay.addWidget(self._gain_w)
+
+        self._amb_w, self._amb_sl = _labeled_slider("Ambient Suppress\n(% kept)", 0, 100, 25)
+        self._amb_sl.valueChanged.connect(lambda v: setattr(self._processor, "ambient_suppress", v / 100))
+        ctrl_lay.addWidget(self._amb_w)
+
+        self._duck_w, self._duck_sl = _labeled_slider("Gunshot Duck\n(% kept)", 0, 50, 10)
+        self._duck_sl.valueChanged.connect(lambda v: setattr(self._processor, "gunshot_duck", v / 100))
+        ctrl_lay.addWidget(self._duck_w)
+
+        root.addWidget(ctrl_grp)
+
+        # --- Learning section ---
+        learn_grp = QGroupBox("Frequency Learning  (AI adaptive mode)")
+        learn_lay = QVBoxLayout(learn_grp)
+
+        tip = QLabel(
+            "HOW TO USE:  Start the stream, enter a game, walk around on different surfaces "
+            f"for ~{LEARN_SECONDS}s, then click  \"Learn Footsteps\".  "
+            "The app captures only moderate-energy sounds (skips silence & gunshots), "
+            "finds the exact frequency peaks, and builds a custom amplification mask."
         )
-        ctrl_layout.addWidget(self._footstep_widget)
-        self._footstep_slider.valueChanged.connect(self._on_footstep_gain)
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #bbb; font-size: 11px;")
+        learn_lay.addWidget(tip)
 
-        self._ambient_widget, self._ambient_slider = make_slider(
-            0, 100, 25, "Ambient Suppress\n(% kept)"
+        btn_row = QHBoxLayout()
+        self._learn_btn = QPushButton("Learn Footsteps")
+        self._learn_btn.setFixedHeight(34)
+        self._learn_btn.setStyleSheet(
+            f"QPushButton {{ background: #1a5c1a; color: white; font-weight: bold; border-radius:5px; }}"
+            f"QPushButton:hover {{ background: #227722; }}"
         )
-        ctrl_layout.addWidget(self._ambient_widget)
-        self._ambient_slider.valueChanged.connect(self._on_ambient_suppress)
+        self._learn_btn.clicked.connect(self._on_learn)
+        btn_row.addWidget(self._learn_btn)
 
-        self._duck_widget, self._duck_slider = make_slider(
-            0, 50, 10, "Gunshot Duck\n(% kept)"
-        )
-        ctrl_layout.addWidget(self._duck_widget)
-        self._duck_slider.valueChanged.connect(self._on_gunshot_duck)
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setFixedHeight(34)
+        self._reset_btn.clicked.connect(self._on_reset_learn)
+        btn_row.addWidget(self._reset_btn)
 
-        root.addWidget(ctrl_group)
+        self._use_learned_cb = QCheckBox("Use learned frequencies")
+        self._use_learned_cb.setEnabled(False)
+        self._use_learned_cb.stateChanged.connect(self._on_use_learned)
+        btn_row.addWidget(self._use_learned_cb)
+        learn_lay.addLayout(btn_row)
+
+        self._learn_status = QLabel("Status: not started")
+        self._learn_status.setStyleSheet(f"color: {GREY};")
+        learn_lay.addWidget(self._learn_status)
+
+        self._peak_label = QLabel("Detected peaks: —")
+        self._peak_label.setStyleSheet("color: #bbb; font-size: 11px;")
+        learn_lay.addWidget(self._peak_label)
+
+        # Spectrum plot
+        self._spectrum_widget = SpectrumWidget(self._processor.learner.freqs)
+        learn_lay.addWidget(self._spectrum_widget)
+
+        root.addWidget(learn_grp)
 
         # --- VU meters ---
-        vu_group = QGroupBox("Level Meters")
-        vu_layout = QVBoxLayout(vu_group)
+        vu_grp = QGroupBox("Level Meters")
+        vu_lay = QVBoxLayout(vu_grp)
 
-        in_vu_row = QHBoxLayout()
-        in_vu_row.addWidget(QLabel("IN "))
-        self._vu_in = QProgressBar()
-        self._vu_in.setMaximum(100)
-        self._vu_in.setTextVisible(False)
-        self._vu_in.setStyleSheet("QProgressBar::chunk { background: #00aaff; }")
-        in_vu_row.addWidget(self._vu_in, 1)
-        vu_layout.addLayout(in_vu_row)
+        for label, attr in [("IN ", "_vu_in"), ("OUT", "_vu_out")]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            bar = QProgressBar()
+            bar.setMaximum(100)
+            bar.setTextVisible(False)
+            color = "#00aaff" if attr == "_vu_in" else ORANGE
+            bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}")
+            setattr(self, attr, bar)
+            row.addWidget(bar, 1)
+            vu_lay.addLayout(row)
 
-        out_vu_row = QHBoxLayout()
-        out_vu_row.addWidget(QLabel("OUT"))
-        self._vu_out = QProgressBar()
-        self._vu_out.setMaximum(100)
-        self._vu_out.setTextVisible(False)
-        self._vu_out.setStyleSheet("QProgressBar::chunk { background: #ff6600; }")
-        out_vu_row.addWidget(self._vu_out, 1)
-        vu_layout.addLayout(out_vu_row)
+        root.addWidget(vu_grp)
 
-        root.addWidget(vu_group)
-
-        # --- Status / toggle ---
-        bottom = QHBoxLayout()
+        # --- Bottom row ---
+        btm = QHBoxLayout()
 
         self._enable_cb = QCheckBox("Processing enabled")
         self._enable_cb.setChecked(True)
-        self._enable_cb.stateChanged.connect(
-            lambda s: setattr(self._processor, "enabled", bool(s))
-        )
-        bottom.addWidget(self._enable_cb)
+        self._enable_cb.stateChanged.connect(lambda s: setattr(self._processor, "enabled", bool(s)))
+        btm.addWidget(self._enable_cb)
 
-        bottom.addStretch()
+        btm.addStretch()
 
         self._status_lbl = QLabel("Stopped")
-        self._status_lbl.setStyleSheet("color: #888;")
-        bottom.addWidget(self._status_lbl)
+        self._status_lbl.setStyleSheet(f"color: {GREY};")
+        btm.addWidget(self._status_lbl)
 
-        self._toggle_btn = QPushButton("▶  Start")
+        self._toggle_btn = QPushButton("Start")
         self._toggle_btn.setFixedHeight(40)
+        self._toggle_btn.setFixedWidth(110)
         self._toggle_btn.setStyleSheet(
-            "QPushButton { background: #cc4400; color: white; font-weight: bold; border-radius: 6px; }"
-            "QPushButton:hover { background: #ff6600; }"
+            f"QPushButton {{ background: #cc4400; color: white; font-weight: bold; border-radius:6px; }}"
+            f"QPushButton:hover {{ background: {ORANGE}; }}"
         )
         self._toggle_btn.clicked.connect(self._on_toggle)
-        bottom.addWidget(self._toggle_btn)
+        btm.addWidget(self._toggle_btn)
 
-        root.addLayout(bottom)
+        root.addLayout(btm)
 
     def _populate_devices(self) -> None:
         self._in_combo.clear()
@@ -213,30 +318,17 @@ class MainWindow(QMainWindow):
             self._status_lbl.setText(f"Device error: {exc}")
 
     # ------------------------------------------------------------------
-    # Slider callbacks
-    # ------------------------------------------------------------------
-
-    def _on_footstep_gain(self, value: int) -> None:
-        self._processor.footstep_gain = value * 0.1
-
-    def _on_ambient_suppress(self, value: int) -> None:
-        self._processor.ambient_suppress = value / 100.0
-
-    def _on_gunshot_duck(self, value: int) -> None:
-        self._processor.gunshot_duck = value / 100.0
-
-    # ------------------------------------------------------------------
-    # Start / stop
+    # Stream start / stop
     # ------------------------------------------------------------------
 
     def _on_toggle(self) -> None:
         if self._engine and self._engine.is_running():
             self._engine.stop()
-            self._toggle_btn.setText("▶  Start")
+            self._toggle_btn.setText("Start")
             self._status_lbl.setText("Stopped")
-            self._status_lbl.setStyleSheet("color: #888;")
+            self._status_lbl.setStyleSheet(f"color: {GREY};")
         else:
-            in_idx = self._in_combo.currentData()
+            in_idx  = self._in_combo.currentData()
             out_idx = self._out_combo.currentData()
             if in_idx is None or out_idx is None:
                 self._status_lbl.setText("No device selected")
@@ -254,22 +346,122 @@ class MainWindow(QMainWindow):
                 else:
                     self._engine.update_devices(in_idx, out_idx, 48000, 2)
                 self._engine.start()
-                self._toggle_btn.setText("■  Stop")
-                self._status_lbl.setText("Running — listening for footsteps…")
-                self._status_lbl.setStyleSheet("color: #00cc66;")
+                self._toggle_btn.setText("Stop")
+                self._status_lbl.setText("Running …")
+                self._status_lbl.setStyleSheet(f"color: {GREEN};")
             except Exception as exc:
                 self._status_lbl.setText(f"Error: {exc}")
-                self._status_lbl.setStyleSheet("color: #ff4444;")
+                self._status_lbl.setStyleSheet(f"color: {RED};")
 
     # ------------------------------------------------------------------
-    # VU meter refresh
+    # Learning
     # ------------------------------------------------------------------
 
-    def _start_vu_timer(self) -> None:
-        self._vu_timer = QTimer(self)
-        self._vu_timer.setInterval(50)  # 20 fps
-        self._vu_timer.timeout.connect(self._update_vu)
-        self._vu_timer.start()
+    def _on_learn(self) -> None:
+        learner = self._processor.learner
+
+        if learner.is_learning:
+            # Manual stop → finalize immediately
+            self._stop_learning()
+            return
+
+        if not (self._engine and self._engine.is_running()):
+            self._learn_status.setText("Start the audio stream first.")
+            self._learn_status.setStyleSheet(f"color: {RED};")
+            return
+
+        # Start learning
+        learner.start()
+        self._learn_ticks = LEARN_SECONDS * 4   # 250 ms ticks
+        self._learn_btn.setText(f"Stop Learning  ({LEARN_SECONDS}s)")
+        self._learn_btn.setStyleSheet(
+            "QPushButton { background: #7a2200; color: white; font-weight: bold; border-radius:5px; }"
+        )
+        self._use_learned_cb.setEnabled(False)
+        self._learn_status.setText(f"Listening …  0 frames captured")
+        self._learn_status.setStyleSheet(f"color: {ORANGE};")
+        self._learn_timer.start()
+
+    def _learn_tick(self) -> None:
+        """Called every 250 ms while learning."""
+        learner = self._processor.learner
+        frames = learner.frames_collected
+        elapsed = LEARN_SECONDS - (self._learn_ticks * 0.25)
+
+        # Live spectrum preview
+        avg = learner.get_avg_spectrum()
+        self._spectrum_widget.update_spectrum(avg, None, [])
+
+        self._learn_status.setText(
+            f"Listening …  {frames} frames captured  ({elapsed:.1f}s / {LEARN_SECONDS}s)"
+        )
+
+        self._learn_ticks -= 1
+        if self._learn_ticks <= 0:
+            self._stop_learning()
+
+    def _stop_learning(self) -> None:
+        self._learn_timer.stop()
+        self._processor.learner.stop()
+        self._learn_btn.setText("Learn Footsteps")
+        self._learn_btn.setStyleSheet(
+            "QPushButton { background: #1a5c1a; color: white; font-weight: bold; border-radius:5px; }"
+            "QPushButton:hover { background: #227722; }"
+        )
+
+        mask = self._processor.learner.finalize()
+        if mask is None:
+            frames = self._processor.learner.frames_collected
+            self._learn_status.setText(
+                f"Not enough data ({frames} frames). Walk around longer and try again."
+            )
+            self._learn_status.setStyleSheet(f"color: {RED};")
+            return
+
+        peaks = self._processor.learner.peak_freqs
+        avg   = self._processor.learner.avg_spectrum
+        self._spectrum_widget.update_spectrum(avg, mask, peaks)
+
+        peak_str = ",  ".join(f"{f:.0f} Hz" for f in peaks[:10])
+        self._peak_label.setText(f"Learned peaks:  {peak_str}")
+
+        self._learn_status.setText(
+            f"Done! Learned {len(peaks)} frequency peaks from "
+            f"{self._processor.learner.frames_collected} frames. "
+            f"Enable \"Use learned frequencies\" to activate."
+        )
+        self._learn_status.setStyleSheet(f"color: {GREEN};")
+        self._use_learned_cb.setEnabled(True)
+
+    def _on_reset_learn(self) -> None:
+        self._learn_timer.stop()
+        self._processor.learner.reset()
+        self._processor.use_learned = False
+        self._use_learned_cb.setChecked(False)
+        self._use_learned_cb.setEnabled(False)
+        self._spectrum_widget.clear_all()
+        self._peak_label.setText("Detected peaks: —")
+        self._learn_status.setText("Reset. Ready to learn again.")
+        self._learn_status.setStyleSheet(f"color: {GREY};")
+        self._learn_btn.setText("Learn Footsteps")
+        self._learn_btn.setStyleSheet(
+            "QPushButton { background: #1a5c1a; color: white; font-weight: bold; border-radius:5px; }"
+            "QPushButton:hover { background: #227722; }"
+        )
+
+    def _on_use_learned(self, state: int) -> None:
+        enabled = bool(state)
+        self._processor.use_learned = enabled
+        if enabled:
+            self._status_lbl.setText("Running — learned mask active")
+            self._status_lbl.setStyleSheet(f"color: {GREEN};")
+        elif self._engine and self._engine.is_running():
+            self._status_lbl.setText("Running — fixed bandpass mode")
+            self._status_lbl.setStyleSheet(f"color: {GREEN};")
+
+    # ------------------------------------------------------------------
+    # VU meters
+    # ------------------------------------------------------------------
 
     def _update_vu(self) -> None:
         if self._engine and self._engine.is_running():
@@ -284,26 +476,25 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _apply_dark_theme(self) -> None:
-        palette = QPalette()
-        palette.setColor(QPalette.Window, QColor(30, 30, 30))
-        palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
-        palette.setColor(QPalette.Base, QColor(20, 20, 20))
-        palette.setColor(QPalette.AlternateBase, QColor(40, 40, 40))
-        palette.setColor(QPalette.Text, QColor(220, 220, 220))
-        palette.setColor(QPalette.Button, QColor(50, 50, 50))
-        palette.setColor(QPalette.ButtonText, QColor(220, 220, 220))
-        palette.setColor(QPalette.Highlight, QColor(255, 102, 0))
-        palette.setColor(QPalette.HighlightedText, Qt.white)
-        QApplication.instance().setPalette(palette)
+        p = QPalette()
+        p.setColor(QPalette.Window,          QColor(28, 28, 28))
+        p.setColor(QPalette.WindowText,      QColor(220, 220, 220))
+        p.setColor(QPalette.Base,            QColor(18, 18, 18))
+        p.setColor(QPalette.AlternateBase,   QColor(38, 38, 38))
+        p.setColor(QPalette.Text,            QColor(220, 220, 220))
+        p.setColor(QPalette.Button,          QColor(48, 48, 48))
+        p.setColor(QPalette.ButtonText,      QColor(220, 220, 220))
+        p.setColor(QPalette.Highlight,       QColor(255, 102, 0))
+        p.setColor(QPalette.HighlightedText, Qt.white)
+        QApplication.instance().setPalette(p)
         self.setStyleSheet(
-            "QGroupBox { border: 1px solid #444; border-radius: 6px; margin-top: 8px; padding-top: 8px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; color: #ff6600; }"
-            "QComboBox, QLabel { color: #ddd; }"
-            "QProgressBar { border: 1px solid #555; border-radius: 3px; background: #222; }"
+            "QGroupBox { border:1px solid #444; border-radius:6px; margin-top:8px; padding-top:8px; }"
+            "QGroupBox::title { subcontrol-origin:margin; left:10px; color:#ff6600; }"
+            "QComboBox, QLabel { color:#ddd; }"
+            "QProgressBar { border:1px solid #555; border-radius:3px; background:#222; }"
+            "QPushButton { border-radius:4px; padding:4px 10px; }"
         )
 
-    # ------------------------------------------------------------------
-    # Cleanup
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
@@ -313,14 +504,13 @@ class MainWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
+    pg.setConfigOptions(antialias=True)
     app = QApplication(sys.argv)
     app.setApplicationName("CoD Footstep Enhancer")
-    window = MainWindow()
-    window.show()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec_())
 
 
