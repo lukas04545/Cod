@@ -199,7 +199,7 @@ class MainWindow(QMainWindow):
         ctrl_grp = QGroupBox("Enhancement Controls")
         ctrl_lay = QHBoxLayout(ctrl_grp)
 
-        self._gain_w, self._gain_sl = _labeled_slider("Footstep Gain\n(×0.1)", 10, 120, 40)
+        self._gain_w, self._gain_sl = _labeled_slider("Footstep Gain\n(×0.1)", 10, 120, 30)
         self._gain_sl.valueChanged.connect(lambda v: setattr(self._processor, "footstep_gain", v * 0.1))
         ctrl_lay.addWidget(self._gain_w)
 
