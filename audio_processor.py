@@ -795,6 +795,57 @@ class FootstepEnhancer:
         self._hold_blocks = max(1, int(0.15 * sample_rate / block_size))
 
     # ------------------------------------------------------------------
+    # Sample-rate change (device switch)
+
+    def set_sample_rate(self, sample_rate: int) -> None:
+        """
+        Rebuild all rate-dependent state for a new sample rate.  Called by
+        the stream engine when the audio device changes.  A learned profile
+        survives the switch: it is re-interpolated onto the new bins.
+        """
+        rate_changed = sample_rate != self.sample_rate
+        self.sample_rate = sample_rate
+
+        if rate_changed:
+            old = self.learner
+            self.learner = FrequencyLearner(
+                sample_rate=sample_rate,
+                n_fft=max(self.block_size * 8, 4096),
+            )
+            if old.learned_mask is not None:
+                self.learner.learned_mask = np.interp(
+                    self.learner.freqs, old.freqs, old.learned_mask)
+                self.learner.avg_spectrum = np.interp(
+                    self.learner.freqs, old.freqs, old.avg_spectrum)
+                self.learner.peak_freqs = list(old.peak_freqs)
+                self.learner.classifier = old.classifier
+                self.learner.learned_from_onsets = old.learned_from_onsets
+                self.learner.mask_version = old.mask_version + 1
+
+            self._gunshot = TransientDetector(sample_rate=sample_rate)
+            self._footstep = FootstepDetector(
+                sensitivity=self.detect_sensitivity,
+                block_duration=self.block_size / sample_rate,
+            )
+            self._duck = GainSmoother(sample_rate, rise_ms=220.0, fall_ms=4.0)
+            self._agc = AutoGainControl(sample_rate)
+            self._limiter = SoftLimiter(sample_rate)
+            self._cadence = CadenceTracker(self.block_size / sample_rate)
+            block_s = self.block_size / sample_rate
+            self._boost_rise = float(np.exp(-block_s / 0.010))
+            self._boost_fall = float(np.exp(-block_s / 0.300))
+            self._hold_blocks = max(1, int(0.15 * sample_rate
+                                           / self.block_size))
+
+        # Always reset streaming state so a restarted stream starts clean
+        self._engine = None
+        self._mask_key = None
+        self._fp_version = -1
+        self._boost_state = 1.0
+        self._widen_prev = (1.0, 1.0)
+        self.footstep_active = 0
+
+    # ------------------------------------------------------------------
     # Shape mask construction (cached)
 
     def _shape_mask(self, freqs: np.ndarray) -> np.ndarray:

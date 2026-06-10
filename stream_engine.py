@@ -79,10 +79,8 @@ class StreamEngine:
         self.output_device = output_device
         self.sample_rate = sample_rate
         self.channels = channels
-        # Rebuild filters for possibly new sample rate
-        self.processor.sample_rate = sample_rate
-        self.processor._design_filters()
-        self.processor._bp_zi = None  # reset states
+        # Rebuild rate-dependent processor state for the new sample rate
+        self.processor.set_sample_rate(sample_rate)
         if was_running:
             self.start()
 

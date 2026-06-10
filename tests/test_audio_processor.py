@@ -498,6 +498,53 @@ def test_direction_widening():
 
 
 # ---------------------------------------------------------------------------
+# Device / sample-rate changes
+# ---------------------------------------------------------------------------
+
+def test_set_sample_rate_keeps_profile_and_processes():
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    assert learn_from(enh, footstep_tones()) is not None
+    old_peaks = list(enh.learner.peak_freqs)
+
+    enh.set_sample_rate(44100)
+    assert enh.learner.sample_rate == 44100
+    # Profile survives the device switch
+    assert enh.learner.learned_mask is not None
+    assert enh.learner.peak_freqs == old_peaks
+    # Mask must boost the learned band on the new frequency grid too
+    freqs = enh.learner.freqs
+    band = enh.learner.learned_mask[(freqs > 280) & (freqs < 320)]
+    assert band.max() > 1.5
+
+    enh.use_learned = True
+    out = enh.process(np.zeros((HOP, 2), dtype=np.float32))
+    assert out.shape == (HOP, 2)
+
+    # Same rate again: cheap reset path, still functional
+    enh.set_sample_rate(44100)
+    out = enh.process((np.random.default_rng(0)
+                       .standard_normal((HOP, 2)) * 0.1).astype(np.float32))
+    assert out.shape == (HOP, 2)
+    assert np.all(np.isfinite(out))
+
+
+def test_stream_engine_update_devices():
+    """Regression: update_devices() used to call removed Butterworth
+    internals (_design_filters/_bp_zi) and crash."""
+    try:
+        from stream_engine import StreamEngine
+    except OSError:
+        pytest.skip("PortAudio not available in this environment")
+    enh = FootstepEnhancer(sample_rate=FS, block_size=HOP)
+    eng = StreamEngine(processor=enh, input_device=None, output_device=None,
+                       sample_rate=FS, block_size=HOP, channels=2)
+    eng.update_devices(None, None, 44100, 2)   # stream not running: no audio I/O
+    assert enh.sample_rate == 44100
+    out = enh.process(np.zeros((HOP, 2), dtype=np.float32))
+    assert out.shape == (HOP, 2)
+
+
+# ---------------------------------------------------------------------------
 # Performance
 # ---------------------------------------------------------------------------
 
